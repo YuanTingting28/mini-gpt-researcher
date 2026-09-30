@@ -1,0 +1,9 @@
+# 学习项目不锁版本，装不上时再去掉对应行
+openai
+python-dotenv
+requests
+beautifulsoup4
+lxml
+ddgs
+tiktoken
+json-repair
