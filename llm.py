@@ -23,8 +23,10 @@
 
 from __future__ import annotations
 
+from idlelib.autocomplete import completion_kwds
+import time
 from openai import OpenAI
-
+import openai
 from config import Config, load_config, resolve_llm
 
 
@@ -36,12 +38,85 @@ class LLMTruncated(LLMError):
     """输出被 max_tokens 截断，拿不到正文。"""
 
 
+
+#: 值得重试的异常：网络抖动、限流、服务端 5xx。
+#: 注意这里没有 AuthenticationError 和 BadRequestError——
+#: key 错了或参数错了，重试多少次都一样，只会掩盖真正的问题。
+RETRYABLE_ERRORS = (
+    openai.APIConnectionError,
+    openai.APITimeoutError,
+    openai.RateLimitError,
+    openai.InternalServerError,
+)
+
 #: 每次调用的用量记录，阶段 7 的 CostTracker 从这里取数
 USAGE_LOG: list[dict] = []
 
 #: 最近一次调用的元信息，方便自检和调试
 LAST_FINISH_REASON: str = ""
 LAST_REASONING_TOKENS: int = 0
+
+def _chat_once(
+        messages:list[dict],
+        *,
+        model:str,
+        temperature:float | None,
+        max_tokens:int | None,
+        json_mode:bool,
+        cfg:Config,
+) -> str:
+    """单次调用 失败直接抛 由chat()决定要不要重试"""
+    global LAST_FINISH_REASON, LAST_REASONING_TOKENS
+    api_key, base_url, model_name = resolve_llm(model)
+    client = OpenAI(
+        api_key=api_key,
+        base_url=base_url,
+        timeout=cfg.llm_timeout,
+        max_retries=0 #关掉sdk自带的重试，改用自己的
+    )
+    kwargs = {}
+    if json_mode:
+        kwargs["response_format"] = {"type": "json_object"}
+    if max_tokens is None:
+        max_tokens = cfg.smart_token_limit
+    if model_name.startswith("deepseek") and max_tokens > 8192:
+        raise LLMError(
+            f"max_tokens={max_tokens} 超过 deepseek 上限 8192，会被 API 直接拒绝"
+        )
+    response = client.chat.completions.create(
+        model=model_name,
+        messages=messages,
+        temperature=cfg.temperature if temperature is None else temperature,
+        max_tokens=max_tokens,
+        **kwargs,
+    )
+    #这里是给了很多条回复吗？
+    choice = response.choices[0]
+    content = choice.message.content or ""
+    LAST_FINISH_REASON = choice.finish_reason or ""
+
+    reasoning_tokens = 0
+    if response.usage and response.usage.completion_tokens_details is not None:
+        reasoning_tokens =  response.usage.completion_tokens_details.reasoning_tokens or 0
+    LAST_REASONING_TOKENS = reasoning_tokens
+
+    USAGE_LOG.append(
+        {
+            "model":model_name,
+            "prompt_tokens":response.usage.prompt_tokens if response.usage else 0,
+            "completion_tokens":response.usage.completion_tokens if response.usage else 0,
+            "reasoning_tokens":reasoning_tokens,
+        }
+    )
+    if not content.strip():
+        if LAST_FINISH_REASON == "length":
+            raise LLMTruncated(
+                f"输出被 max_tokens={max_tokens} 截断，正文为空"
+                f"（其中 {reasoning_tokens} 个 token 用于推理）。"
+                f"把 max_tokens 调大（建议 >= 1024）再试。"
+            )
+        raise LLMError(f"模型返回了空正文，finish_reason={LAST_FINISH_REASON!r}")
+    return content
 
 
 def chat(
@@ -52,6 +127,7 @@ def chat(
     max_tokens: int | None = None,
     json_mode: bool = False,
     cfg: Config | None = None,
+    retries: int = 3,
 ) -> str:
     """发一次对话请求，返回纯文本。
 
@@ -65,52 +141,24 @@ def chat(
 
     cfg = cfg or load_config()
     model = model or cfg.smart_llm
-    api_key, base_url, model_name = resolve_llm(model)
 
-    client = OpenAI(api_key=api_key, base_url=base_url)
-    kwargs = {}
-    if json_mode:
-        kwargs["response_format"] = {"type": "json_object"}
-
-    # max_tokens 不传时回落配置值；不设上限的话推理模型可能长时间不返回
-    if max_tokens is None:
-        max_tokens = cfg.smart_token_limit
-    if model_name.startswith("deepseek") and max_tokens > 8192:
-        raise LLMError(f"max_tokens={max_tokens} 超过 deepseek 上限 8192，会被 API 直接拒绝")
-
-    response = client.chat.completions.create(
-        model=model_name,
-        messages=messages,
-        temperature=cfg.temperature if temperature is None else temperature,
-        max_tokens=max_tokens,
-        **kwargs,
-    )
-
-    choice = response.choices[0]
-    content = choice.message.content or ""
-    LAST_FINISH_REASON = choice.finish_reason or ""
-
-    reasoning_tokens = 0
-    if response.usage and response.usage.completion_tokens_details is not None:
-        reasoning_tokens = response.usage.completion_tokens_details.reasoning_tokens or 0
-    LAST_REASONING_TOKENS = reasoning_tokens
-
-    USAGE_LOG.append(
-        {
-            "model": model_name,
-            "prompt_tokens": response.usage.prompt_tokens if response.usage else 0,
-            "completion_tokens": response.usage.completion_tokens if response.usage else 0,
-            "reasoning_tokens": reasoning_tokens,
-        }
-    )
-
-    if not content.strip():
-        if LAST_FINISH_REASON == "length":
-            raise LLMTruncated(
-                f"输出被 max_tokens={max_tokens} 截断，正文为空"
-                f"（其中 {reasoning_tokens} 个 token 用于推理）。"
-                f"把 max_tokens 调大（建议 >= 1024）再试。"
+    last_error:Exception | None = None
+    for attempt in range(1,retries+1):
+        try:
+            return _chat_once(
+                messages,
+                model=model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                json_mode=json_mode,
+                cfg=cfg,
             )
-        raise LLMError(f"模型返回了空正文，finish_reason={LAST_FINISH_REASON!r}")
-
-    return content
+        except RETRYABLE_ERRORS as exc:
+            last_error = exc
+            if attempt >= retries:
+                break
+            delay = 2 ** (attempt - 1)
+            time.sleep(delay)
+        raise LLMError(
+            f"连续 {retries} 次调用失败，最后一次：{type(last_error).__name__}: {last_error}"
+        ) from last_error

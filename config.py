@@ -104,7 +104,7 @@ class Config:
 
     report_type: str = _env_str("REPORT_TYPE", "research_report")
     total_words: int = _env_int("TOTAL_WORDS", 1000)
-
+    llm_timeout: int = _env_int("LLM_TIMEOUT", 120)
     scrape_timeout: int = _env_int("SCRAPE_TIMEOUT", 15)
 
     # 检索器的 HTTP 超时

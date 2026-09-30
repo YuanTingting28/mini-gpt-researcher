@@ -20,10 +20,29 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
-
+from llm import chat
+import prompts
 from config import Config, load_config
+from search import get_retriever
 
+logger = logging.getLogger(__name__)
+
+def format_context(results:list[dict[str,Any]])->str:
+    """把检索结果拼成带编号的上下文。
+    **编号在这里就固定下来** ——阶段6的引用角标和参考文献依靠这个，绝对不能让模型自己发明编号
+    对照源码: context += f"[{i}]{title}:{body}({url})\n\n"
+    字段用 or 链兜底 因为不同检索器给的键名不完全一致
+
+    """
+    blocks = []
+    for i,item in enumerate(results,1):
+        title = item.get("title") or "(无标题)"
+        body = item.get("body") or item.get("content") or ""
+        url = item.get("href") or item.get("url") or ""
+        blocks.append(f"[{i}]{title}\n{body}\n来源:{url}\n")
+    return "\n".join(blocks)
 
 def quick_summary(query: str, *, cfg: Config | None = None) -> str:
     """阶段 2：搜索一次，让模型写一段带来源的短答案。
@@ -36,7 +55,18 @@ def quick_summary(query: str, *, cfg: Config | None = None) -> str:
       2. 拼 context：每条 "标题 / 链接 / 摘要"
       3. llm.chat，提示词要求：200 字以内 + 引用来源链接
     """
-    raise NotImplementedError("阶段 2：实现 quick_summary")
+    cfg = cfg or load_config()
+    #1.检索
+    retriever = get_retriever(cfg.retriever,query)
+    results = retriever.search(cfg.max_search_results)
+    if not results:
+        # 阶段8会一次跑很多子查询，这里不能抛异常
+        return "检索没有返回任何结果，无法生成摘要。"
+    #品上下文
+    context = format_context(results)
+    logger.info("检索到 %d 条来源，上下文共 %d 字符", len(results), len(context))
+    prompt = prompts.quick_summary_prompt(query,context)
+    return chat([{"role":"user","content":prompt}],cfg=cfg)
 
 
 def plan_research(query: str, *, cfg: Config | None = None) -> list[str]:
