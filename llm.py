@@ -64,6 +64,7 @@ def _chat_once(
         max_tokens:int | None,
         json_mode:bool,
         cfg:Config,
+        step:str="default",
 ) -> str:
     """单次调用 失败直接抛 由chat()决定要不要重试"""
     global LAST_FINISH_REASON, LAST_REASONING_TOKENS
@@ -99,13 +100,21 @@ def _chat_once(
     if response.usage and response.usage.completion_tokens_details is not None:
         reasoning_tokens =  response.usage.completion_tokens_details.reasoning_tokens or 0
     LAST_REASONING_TOKENS = reasoning_tokens
+    cache_hit = 0
+    if response.usage is not None:
+        raw = getattr(response.usage,"prompt_cache_hit_tokens",None)
+        if raw is None:
+            raw = (getattr(response.usage,"model_extra",None) or {}).get("prompt_cache_hit_tokens")
+        cache_hit = int(raw or 0)
 
     USAGE_LOG.append(
         {
+            "step":step,
             "model":model_name,
             "prompt_tokens":response.usage.prompt_tokens if response.usage else 0,
             "completion_tokens":response.usage.completion_tokens if response.usage else 0,
             "reasoning_tokens":reasoning_tokens,
+            "cache_hit_tokens":cache_hit
         }
     )
     if not content.strip():
@@ -128,6 +137,7 @@ def chat(
     json_mode: bool = False,
     cfg: Config | None = None,
     retries: int = 3,
+    step: str = "default",
 ) -> str:
     """发一次对话请求，返回纯文本。
 
@@ -152,6 +162,7 @@ def chat(
                 max_tokens=max_tokens,
                 json_mode=json_mode,
                 cfg=cfg,
+                step=step
             )
         except RETRYABLE_ERRORS as exc:
             last_error = exc
@@ -159,6 +170,4 @@ def chat(
                 break
             delay = 2 ** (attempt - 1)
             time.sleep(delay)
-        raise LLMError(
-            f"连续 {retries} 次调用失败，最后一次：{type(last_error).__name__}: {last_error}"
-        ) from last_error
+    raise LLMError(f"连续 {retries} 次调用失败，最后一次：{type(last_error).__name__}: {last_error}") from last_error

@@ -97,16 +97,25 @@ class Config:
     max_search_results: int = _env_int("MAX_SEARCH_RESULTS", 6)
     max_sub_queries: int = _env_int("MAX_SUB_QUERIES", 4)
 
+   #-----并发（阶段8）
+    # 并发抓取/检索的最大线程数，网络IO为主，4-8是甜点去
+    # 调太大容易被目标站限流，我们还没有限流器兜底
+    max_concurrency:int = _env_int("MAX_CONCURRENCY", 4)
+    #一轮研究最多抓取多少页面？ 4个子问题 * 6 条结果 = 24个URL
+    max_pages:int = _env_int("MAX_PAGES", 12)
+
     context_filter: str = _env_str("CONTEXT_FILTER", "keyword")
     compression_threshold: int = _env_int("COMPRESSION_THRESHOLD", 8000)
     keyword_relative_threshold: float = _env_float("KEYWORD_RELATIVE_THRESHOLD", 0.5)
     keyword_max_results: int = _env_int("KEYWORD_MAX_RESULTS", 25)
-
+    chunk_size: int = _env_int("CHUNK_SIZE", 1000)
+    chunk_overlap: int = _env_int("CHUNK_OVERLAP", 150)
     report_type: str = _env_str("REPORT_TYPE", "research_report")
     total_words: int = _env_int("TOTAL_WORDS", 1000)
     llm_timeout: int = _env_int("LLM_TIMEOUT", 120)
+    #这里有爬取正文的事-所以和爬虫有关
     scrape_timeout: int = _env_int("SCRAPE_TIMEOUT", 15)
-
+    scrape_max_chars: int = _env_int("SCRAPE_MAX_CHARS", 12000)
     # 检索器的 HTTP 超时
     request_timeout: int = _env_int("REQUEST_TIMEOUT", 15)
     def show(self) -> str:

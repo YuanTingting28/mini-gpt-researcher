@@ -222,10 +222,14 @@ def cmd_fetch(args: argparse.Namespace) -> int:
     from scrape import fetch
 
     page = fetch(args.url, cfg=load_config())
-    print(f"标题: {page.get('title')}")
-    print(f"长度: {len(page.get('raw_content') or '')} 字符")
+    if not page["ok"]:
+        print(f"抓取失败：{page['reason']}（HTTP {page['status']}）")
+        return 1
+    print(f"标题: {page['title']}")
+    print(f"长度: {len(page['raw_content'])} 字符")
+    print(f"最终地址: {page['url']}")
     print("-" * 60)
-    print((page.get("raw_content") or "")[:300])
+    print(page["raw_content"][:300])
     return 0
 
 
@@ -248,6 +252,8 @@ def cmd_report(args: argparse.Namespace) -> int:
 
     result = research_report(args.query, cfg=load_config(), with_costs=args.costs)
     print(result["report"])
+    if result.get("path"):
+        print(f"\n（已写入 {result['path']}）")
     if args.costs:
         print("\n" + "-" * 60)
         print(result["cost_report"])
@@ -259,6 +265,8 @@ def cmd_research(args: argparse.Namespace) -> int:
     from pipeline import full_research
 
     result = full_research(args.query, cfg=load_config())
+    for i, sub in enumerate(result.get("sub_queries", []), 1):
+        print(f"  {i}. {sub}")
     print(f"报告已写入: {result['path']}")
     print(result["cost_report"])
     return 0

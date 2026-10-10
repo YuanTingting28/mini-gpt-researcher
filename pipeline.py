@@ -25,6 +25,7 @@ import re
 from typing import Any
 from llm import chat
 from prompts import quick_summary_prompt,search_queries_prompt
+from concurrent.futures import ThreadPoolExecutor,as_completed
 from config import Config, load_config
 from search import get_retriever
 import json
@@ -151,7 +152,7 @@ def quick_summary(query: str, *, cfg: Config | None = None) -> str:
     context = format_context(results)
     logger.info("检索到 %d 条来源，上下文共 %d 字符", len(results), len(context))
     prompt = quick_summary_prompt(query,context)
-    return chat([{"role":"user","content":prompt}],cfg=cfg)
+    return chat([{"role":"user","content":prompt}],cfg=cfg,step="摘要")
 
 
 def plan_research(query: str, *, cfg: Config | None = None) -> list[str]:
@@ -171,7 +172,7 @@ def plan_research(query: str, *, cfg: Config | None = None) -> list[str]:
     """
     cfg = cfg or load_config()
     prompt = search_queries_prompt(query,cfg.max_sub_queries)
-    response = chat([{"role":"user","content":prompt}],cfg=cfg)
+    response = chat([{"role":"user","content":prompt}],cfg=cfg,step="子问题")
     parsed = parse_json(response)
     if parsed is None:
         logger.warning("子问题json解析失败，退化为原始查询，模型输出前200字:%r",response[:200])
@@ -179,9 +180,8 @@ def plan_research(query: str, *, cfg: Config | None = None) -> list[str]:
     #数量上限由代码保证
     sub_queries = sub_queries[:cfg.max_sub_queries]
     if sub_queries == [query]:
-        if sub_queries == [query]:
             logger.warning("模型未产出有效子问题，将直接检索原始查询")
-        else:
+    else:
             logger.info("拆出 %d 个子问题：%s", len(sub_queries), sub_queries)
 
     return sub_queries
@@ -193,19 +193,184 @@ def build_context(query: str, *, cfg: Config | None = None) -> dict[str, Any]:
     TODO(阶段 5)：串起 search / scrape / context 三层。
     并发抓取放到阶段 8 再做，这里先串行。
     """
-    raise NotImplementedError("阶段 5：实现 build_context")
+    from context import select_context
+    from scrape import fetch
+    cfg = cfg or load_config()
+    retriever = get_retriever(cfg.retriever,query)
+    results = retriever.search(cfg.max_search_results)
+    pages:list[dict[str, Any]] = []
+    for item in results:
+        url  = item.get("url") or item.get("href")
+        if not url:
+            continue
+        page = fetch(url,cfg=cfg)
+        if not page["ok"]:
+            # 单页失败只跳过，不中断整轮 —— 其他页面还能提供价值
+            logger.info("抓取失败，跳过 %s（%s）", url, page["reason"])
+            continue
+        pages.append(
+            {
+                "title": page["title"] or item.get("title") or "",
+                "url": page["url"],
+                "raw_content": page["raw_content"],
+            }
+        )
+    if not pages:
+        logger.warning("全部抓取失败，没有可用上下文")
+        return {"context": "", "sources": [], "raw_chars": 0}
+    raw_chars = sum(len(p["raw_content"]) for p in pages)
+    context = select_context(query,pages,cfg=cfg)
+    logger.info(
+        "抓取 %d 页 / %d 字符 -> 上下文 %d 字符", len(pages), raw_chars, len(context)
+    )
+    return {"context": context, "sources": pages, "raw_chars": raw_chars}
 
+#----并发阶段
+def _normalize_url(url:str)->str:
+    """URL归一化 只用于去重比较，不用于抓取
+    去掉片段（#...) 同一个页面的不同锚点不该抓取两次
+    去掉末尾斜杠
+    保留query 因为很多站点的正文靠query区分
+    """
+    base = (url or "").strip().split("#",1)[0]
+    while base.endswith("/") and base.count("/")>2:
+        base = base[:-1]
+    return base
+def _search_one(sub_query:str,cfg:Config)->list[dict[str, Any]]:
+    """但各子问题检索，抛异常由调用方决定怎么处理"""
+    retriever = get_retriever(cfg.retriever,sub_query)
+    return retriever.search(cfg.max_search_results)
+
+def _fetch_one(url:str,search_title:str,cfg:Config)->dict[str,Any] | None:
+    from scrape import fetch
+    page = fetch(url,cfg=cfg)
+    if not page["ok"]:
+        logger.info("抓取失败，跳过 %s（%s）", url, page["reason"])
+        return None
+    return {
+        "title": page["title"] or search_title or "",
+        "url": page["url"],
+        "raw_content": page["raw_content"],
+    }
+
+def _collect_pages(sub_queries:list[str],cfg:Config)->list[dict[str, Any]]:
+    """并发检索+全局去重+并发抓取，返回[按首次出现顺序]排好的页面列表
+    单独抽出来是为了能离线测试：_search_one/_fetch_one 可以被打桩替换
+    """
+    #  --- 1.并发检索，每个子问题一次search
+    hits_by_query:dict[str,list[dict[str, Any]]] = {}
+    if not sub_queries:
+        return []
+    workers = max(1,min(cfg.max_concurrency,len(sub_queries)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_search_one,sub,cfg):sub for sub in sub_queries}
+        for fut in as_completed(futures):
+            sub = futures[fut]
+            try:
+                hits_by_query[sub] = fut.result() or []
+            except Exception as exc:
+                logger.warning("子问题检索失败，跳过「%s」：%s", sub, exc)
+    # ----2.全局去重 跨子问题 同一个URL只抓一次
+    urls:list[str] = []
+    titles:dict[str, str] = {}
+    seen:set[str] = set()
+    for sub in sub_queries:
+        for item in hits_by_query.get(sub,[]):
+            url = (item.get("url") or item.get("href") or "").strip()
+            key = _normalize_url(url)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            urls.append(url)
+            titles[url] = item.get("title") or ""
+    if len(urls)>cfg.max_pages:
+        logger.info("去重后 %d 个 URL 超过 MAX_PAGES=%d，截断", len(urls), cfg.max_pages)
+        urls = urls[:cfg.max_pages]
+    logger.info("%d 个子问题 -> 去重后 %d 个 URL 待抓取", len(hits_by_query), len(urls))
+    if not urls:
+        return []
+    # ------3 并发抓取
+    fetched:dict[str,dict[str, Any] | None] = {}
+    workers = max(1,min(cfg.max_concurrency,len(urls)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(_fetch_one,url,titles.get("url",""),cfg):url for url in urls
+        }
+        for fut in as_completed(futures):
+            url = futures[fut]
+            try:
+                fetched[url] = fut.result()
+            except Exception as exc:
+                logger.warning("抓取异常，跳过 %s：%s", url, exc)
+                fetched[url] = None
+
+    # ------4.按检索顺序回填
+    #并发完成顺序是乱的，而上下文[n]的编号是引用体系的根，必须可复现，所以这里不按完成顺序，而是urls的顺序
+    pages:list[dict[str, Any]] = []
+    seen_final:set[str] = set()
+    for url in urls:
+        page = fetched.get(url) #通过url取，也按url的顺序来
+        if page is None:
+            continue
+        key = _normalize_url(page["url"])
+        if key in seen_final:
+            # 不同短链重定向到同一页，抓完才发现撞车
+            logger.info("重定向撞车，跳过 %s", page["url"])
+            continue
+        seen_final.add(key)
+        pages.append(page)
+    return pages
 
 def research_report(query: str, *, cfg: Config | None = None, with_costs: bool = False) -> dict[str, Any]:
     """阶段 6：build_context + write_report。
 
     TODO(阶段 6)：返回 {report, sources, cost_report}
     """
-    raise NotImplementedError("阶段 6：实现 research_report")
+    from report import parse_context_sources,save_report,write_report
+    cfg = cfg or load_config()
+    built = build_context(query,cfg=cfg)
+    context = built["context"]
+    if not context.strip():
+        # 对照源码：gpt_researcher/skills/writer.py:82 —— 一条资料都没有时
+        # 宁可不写，也不能凭空生成一篇"看起来有来源"的报告。
+        logger.warning("没有抓到任何可用资料，不出报告")
+        return {"report": f'没有为"{query}"抓到任何可用资料', "sources": [], "cost_report": "","path":None}
+    sources = parse_context_sources(context)
+    report = write_report(query,context,sources, cfg=cfg)
+    path = save_report(query,report)
+    logger.info("报告已写入 %s（%d 字，%d 个来源）", path, len(report), len(sources))
 
+    cost_report = ""
+    if with_costs:
+        cost_report = _cost_report_hook(cfg)
+    return {
+        "report": report,
+        "sources": sources,
+        "cost_report": cost_report,
+        "path": str(path),
+    }
+
+def _cost_report_hook(cfg: Config) -> str:
+    """阶段 7 的接入点：CostTracker 还没实现，返回提示而不是抛异常。"""
+    from costs import CostTracker
+    from llm import USAGE_LOG
+    try:
+        tracker = CostTracker()
+        for item in USAGE_LOG:
+            tracker.add(item["model"], item["prompt_tokens"], item["completion_tokens"],step=item.get("step", "default"),
+                cache_hit_tokens=item.get("cache_hit_tokens", 0),
+                reasoning_tokens=item.get("reasoning_tokens", 0))
+        return tracker.report()
+    except NotImplementedError:
+        return "（成本统计属于阶段 7，尚未实现）"
 
 def full_research(query: str, *, cfg: Config | None = None) -> dict[str, Any]:
     """阶段 8：完整链路，落盘到 outputs/。
+    阶段 8：拆子问题 -> 并发检索 -> 全局去重 -> 并发抓取 -> 一次压缩 -> 成稿落盘。
+
+    对照源码：gpt_researcher/skills/researcher.py:97 conduct_research（主循环）
+    与上游的差别：上游把子问题塞进 asyncio 事件循环 + rate_limiter；我们全是同步
+    代码，用线程池是最小改动。代价是没有细粒度限流，MAX_CONCURRENCY 是唯一的阀门。
 
     TODO(阶段 8)：
       1. plan_research 拆子问题
@@ -215,4 +380,43 @@ def full_research(query: str, *, cfg: Config | None = None) -> dict[str, Any]:
       5. 汇总上下文 -> 成稿 -> 写 outputs/<时间戳>.md
       6. 返回 {"path": ..., "cost_report": ...}
     """
-    raise NotImplementedError("阶段 8：实现 full_research")
+    from context import select_context
+    from report import  parse_context_sources,save_report,write_report
+    cfg = cfg or load_config()
+    sub_queries = plan_research(query,cfg=cfg)
+    pages = _collect_pages(sub_queries,cfg=cfg)
+    if not pages:
+        # 全局失败停下，但要把原因说清楚（局部失败才降级）
+        logger.warning("一个页面都没抓到，不出报告")
+        return {
+            "report": f'没有为"{query}"抓到任何可用资料',
+            "sources": [],
+            "cost_report": _cost_report_hook(cfg),
+            "path": None,
+            "sub_queries": sub_queries,
+        }
+    raw_chars = sum(len(p["raw_content"]) for p in pages)
+    #用[原问题+子问题]当检索词，子问题是模型按检索需要生成的
+    filter_query = " ".join([query,*sub_queries])
+    context = select_context(filter_query,pages,cfg=cfg)
+    logger.info("抓取 %d 页 / %d 字符 -> 上下文 %d 字符", len(pages), raw_chars, len(context))
+    if not context.strip():
+        logger.warning("压缩后上下文为空，不出报告")
+        return {
+            "report": f'没有为"{query}"找到可用上下文',
+            "sources": pages,
+            "cost_report": _cost_report_hook(cfg),
+            "path": None,
+            "sub_queries": sub_queries,
+        }
+    sources = parse_context_sources(context)
+    report = write_report(query,context,sources, cfg=cfg)
+    path = save_report(query,report)
+    logger.info("报告已写入 %s（%d 字，%d 个来源）", path, len(report), len(sources))
+    return {
+        "report": report,
+        "sources": sources,
+        "cost_report": _cost_report_hook(cfg),
+        "path": str(path),
+        "sub_queries": sub_queries,
+    }

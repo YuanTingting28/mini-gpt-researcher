@@ -256,7 +256,11 @@ python main.py context "gpt-researcher 是什么"
 
 **对照源码**
 
-- `gpt_researcher/skills/writer.py:20` `ReportGenerator`，`:49` `write_report`（主流程）、`:136` `write_report_conclusion`、`:175` `write_introduction`。
+- `gpt_researcher/skills/writer.py:20` `ReportGenerator`，`:49` `logger.warning(
+            "「%s」被 max_tokens=%d 截断（finish_reason=length），报告可能不完整。"
+            "把 .env 里的 SMART_TOKEN_LIMIT 调到 8000 再试",
+            step, min(cfg.smart_token_limit, MAX_TOKENS_CEILING),
+        )write_report`（主流程）、`:136` `write_report_conclusion`、`:175` `write_introduction`。
 - `gpt_researcher/actions/report_generation.py:209` `generate_report`、`:12` `write_report_introduction`、`:63` `write_conclusion`、`:115` `summarize_url`（长文先摘要再进上下文）。
 - `gpt_researcher/prompts.py:262` `generate_report_prompt`（**核心提示词**，注意它怎么约束引用格式）。
 - `gpt_researcher/prompts.py:418` `generate_deep_research_prompt`。
