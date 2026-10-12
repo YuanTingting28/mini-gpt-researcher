@@ -20,7 +20,8 @@ import argparse
 import sys
 
 from config import load_config
-
+import logging
+logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s - %(message)s")
 # ---------------------------------------------------------------- 阶段 0 自检
 
 #: 阶段 0 必需的依赖：导入名 -> 说明
@@ -82,9 +83,12 @@ def _check_config(cfg) -> list[tuple[str, str, str]]:
     out.append(("配置 模型", "OK" if provider in PROVIDERS else "FAIL",
                 f"{cfg.smart_llm} -> provider={provider}"))
 
-    # 上限 8192，超了会 400；给太小又会被推理过程吃光，正文变空
-    if provider == "deepseek" and cfg.smart_token_limit > 8192:
-        out.append(("配置 max_tokens", "FAIL", f"{cfg.smart_token_limit} 超过 deepseek 上限 8192"))
+    # 实测（2026-10-11）8192 / 16000 / 65536 / 131072 都被接受，官方表 384K；
+    # 旧结论「>8192 会 400」是错的，已按实测改成 131072。
+    # 真正要防的是给太小：推理和正文共享额度，太小会让正文变空。
+    if provider == "deepseek" and cfg.smart_token_limit > 131072:
+        out.append(("配置 max_tokens", "FAIL",
+                    f"{cfg.smart_token_limit} 超过实测可用上限 131072（官方声明 384K，未实测）"))
     elif provider == "deepseek" and cfg.smart_token_limit < 1024:
         out.append(("配置 max_tokens", "WARN",
                     f"{cfg.smart_token_limit} 偏小。推理模型的 max_tokens 是「思考+正文」共享额度，"
@@ -271,6 +275,15 @@ def cmd_research(args: argparse.Namespace) -> int:
     print(result["cost_report"])
     return 0
 
+def cmd_agents(args:argparse.Namespace) -> int:
+    """阶段9：多Agent编辑部 / 阶段10：可选的人审提纲"""
+    from agents import run_editorial
+    ask = input if args.human else None
+    if ask is None:
+        print("（未开人审：加 --human 可以在拆完提纲后先看一遍再开始跑）")
+    result = run_editorial(
+        args.query, cfg=load_config(), max_rounds=args.rounds, ask=ask
+    )
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="mini-gpt-researcher")
@@ -310,14 +323,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("query")
     p.set_defaults(func=cmd_research)
 
+    p = sub.add_parser("agents", help="阶段 9：多 Agent 编辑部")
+    p.add_argument("query")
+    p.add_argument("--rounds", type=int, default=3, help="最多评审几轮")
+    p.add_argument(
+        "--human",
+        action="store_true",
+        help="阶段 10：拆完提纲后停下来等人确认（回车接受 / n 打回 / e 自己改）",
+    )
+    p.set_defaults(func=cmd_agents)
     return parser
 
 
 STAGE_OF = {
     "search": 1, "summary": 2, "plan": 3, "fetch": 4,
-    "context": 5, "report": 6, "research": 8,
+    "context": 5, "report": 6, "research": 8,"agents":9
 }
-
 
 def main() -> int:
     args = build_parser().parse_args()

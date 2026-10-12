@@ -220,7 +220,7 @@ def fetch(url: str, *, cfg: Config | None = None,session:requests.Session |None 
     #1. requests.get(url, timeout=cfg.scrape_timeout, headers={"User-Agent": ...})
     cfg = cfg or load_config()
     out:dict[str,Any] = {
-        "url":url,"title":"","raw_content":"","ok":False,"reason":"","status":0
+        "url":url,"title":"","raw_content":"","ok":False,"reason":"","status":0,"transient":False
     }
     headers = {
         "User-Agent": DEFAULT_UA,
@@ -232,9 +232,11 @@ def fetch(url: str, *, cfg: Config | None = None,session:requests.Session |None 
         resp = client.get(url, headers=headers,timeout=cfg.scrape_timeout,allow_redirects=True)
     except requests.Timeout:
         out["reason"] = f"超时（>{cfg.scrape_timeout}s）"
+        out["transient"] = True
         return out
     except requests.RequestException as exc:
         out["reason"] = f"网络错误：{type(exc).__name__}: {str(exc)[:150]}"
+        out["transient"] = True
         return out
 
     out["status"] =resp.status_code

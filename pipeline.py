@@ -236,6 +236,23 @@ def _normalize_url(url:str)->str:
     while base.endswith("/") and base.count("/")>2:
         base = base[:-1]
     return base
+#这个确实，检索不出的下次也别检索了
+#: 抓不出正文的 URL（用 _normalize_url 归一化后作键）-> 上次的原因。
+#: 只记确定性失败：HTTP 4xx/5xx、PDF 没抽文字、非网页、拦截页、正文过短。
+#: 超时/网络错误是瞬时失败，不记 —— 下一轮值得再试。
+#: 实测（2026-10-11 三轮跑）：同一批 403 / 正文过短的链接每轮都被重新排队重抓，
+#: 既占用 MAX_PAGES 名额，又要白等一遍超时。
+_DEAD_URLS: dict[str,str] = {}
+
+def dead_urls()->dict[str,str]:
+    """已确认抓不出正文的 URL 快照（自检/调试用）。"""
+    return dict(_DEAD_URLS)
+
+def reset_dead_urls()->None:
+    """清空负缓存。长驻进程里如果想「过一段时间再试一次」，调这个。"""
+    _DEAD_URLS.clear()
+
+
 def _search_one(sub_query:str,cfg:Config)->list[dict[str, Any]]:
     """但各子问题检索，抛异常由调用方决定怎么处理"""
     retriever = get_retriever(cfg.retriever,sub_query)
@@ -243,6 +260,11 @@ def _search_one(sub_query:str,cfg:Config)->list[dict[str, Any]]:
 
 def _fetch_one(url:str,search_title:str,cfg:Config)->dict[str,Any] | None:
     from scrape import fetch
+    #缓存检索不出的url
+    key = _normalize_url(url)
+    if key in _DEAD_URLS:
+        logger.info("跳过已知抓不出正文的 URL %s（%s）", url, _DEAD_URLS[key])
+        return None
     page = fetch(url,cfg=cfg)
     if not page["ok"]:
         logger.info("抓取失败，跳过 %s（%s）", url, page["reason"])
@@ -280,6 +302,8 @@ def _collect_pages(sub_queries:list[str],cfg:Config)->list[dict[str, Any]]:
             key = _normalize_url(url)
             if not key or key in seen:
                 continue
+            if key in _DEAD_URLS:
+                continue  # 已知抓不出正文，别占 MAX_PAGES 的名额
             seen.add(key)
             urls.append(url)
             titles[url] = item.get("title") or ""

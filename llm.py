@@ -65,6 +65,7 @@ def _chat_once(
         json_mode:bool,
         cfg:Config,
         step:str="default",
+        extra_body:dict | None = None
 ) -> str:
     """单次调用 失败直接抛 由chat()决定要不要重试"""
     global LAST_FINISH_REASON, LAST_REASONING_TOKENS
@@ -78,12 +79,13 @@ def _chat_once(
     kwargs = {}
     if json_mode:
         kwargs["response_format"] = {"type": "json_object"}
+    if extra_body:
+        kwargs["extra_body"] = extra_body
     if max_tokens is None:
         max_tokens = cfg.smart_token_limit
-    if model_name.startswith("deepseek") and max_tokens > 8192:
-        raise LLMError(
-            f"max_tokens={max_tokens} 超过 deepseek 上限 8192，会被 API 直接拒绝"
-        )
+    # 这里原有一条「deepseek max_tokens > 8192 会被 API 拒绝」的守卫，是错的：
+    # 2026-10-11 实测 8192 / 16000 / 65536 / 131072 全部被接受（官方表 384K）。
+    # 它会把「把额度调大」这条正路直接堵死，所以删掉。
     response = client.chat.completions.create(
         model=model_name,
         messages=messages,
@@ -138,6 +140,7 @@ def chat(
     cfg: Config | None = None,
     retries: int = 3,
     step: str = "default",
+    extra_body: dict | None = None
 ) -> str:
     """发一次对话请求，返回纯文本。
 
@@ -162,7 +165,8 @@ def chat(
                 max_tokens=max_tokens,
                 json_mode=json_mode,
                 cfg=cfg,
-                step=step
+                step=step,
+                extra_body=extra_body
             )
         except RETRYABLE_ERRORS as exc:
             last_error = exc

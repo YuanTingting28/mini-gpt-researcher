@@ -44,7 +44,6 @@ _TOC_HEADING = re.compile(r"^#{1,3}\s*(目录|Table of Contents)\s*[:：]?\s*$",
 
 BODY_TEMPERATURE = 0.35      # 对照上游 report_generation.py:298
 SIDE_TEMPERATURE = 0.25      # 引言/结论，对照上游 :48 和 :100
-MAX_TOKENS_CEILING = 8192    # deepseek 的硬上限
 # ------------------------------------------------------------------ 编号解析
 def parse_context_sources(context: str) -> list[dict[str, Any]]:
     """
@@ -171,7 +170,7 @@ def _insert_introduction(body: str, intro: str) -> str:
 # ------------------------------------------------------------------ 生成
 
 
-def build_report_prompt(query: str, context: str, *, cfg: Config) -> str:
+def build_report_prompt(query: str, context: str, *, cfg: Config,extra:str="") -> str:
     """拼报告提示词。
 
     对照源码：gpt_researcher/prompts.py:262
@@ -186,7 +185,8 @@ def build_report_prompt(query: str, context: str, *, cfg: Config) -> str:
     return report_prompt(
         query,context,
         total_words=cfg.total_words,
-        max_source=max((s["n"] for s in sources),default=0)
+        max_source=max((s["n"] for s in sources),default=0),
+        extra=extra,
     )
 
 
@@ -242,15 +242,18 @@ def _generate(prompt:str,cfg: Config,*,step:str,temperature:float) -> str:
         [{"role":"user","content":prompt}],
         cfg=cfg,
         temperature=temperature,
-        max_tokens=min(cfg.smart_token_limit,MAX_TOKENS_CEILING),
+        max_tokens=cfg.smart_token_limit,
         step=step
     )
     if llm.LAST_FINISH_REASON == "length":
         logger.warning(
             "「%s」被 max_tokens=%d 截断（finish_reason=length），报告可能不完整。"
-            "把 .env 里的 SMART_TOKEN_LIMIT 调到 8000 再试",
+            "其中 %d 个 token 用于推理 —— 推理和正文共享这一个额度，"
+            "所以要把 .env 里的 SMART_TOKEN_LIMIT 调大（当前 %d）再试。",
             step,
-            min(cfg.smart_token_limit, MAX_TOKENS_CEILING),
+            cfg.smart_token_limit,
+            llm.LAST_REASONING_TOKENS,
+            cfg.smart_token_limit,
         )
     return text.strip()
 
@@ -272,6 +275,7 @@ def write_report(
     cfg: Config | None = None,
     with_introduction: bool = True,
     with_conclusion: bool = True,
+    extra_instructions:str="",
 ) -> str:
     """生成完整报告。
 
@@ -288,8 +292,65 @@ def write_report(
     cfg = cfg or load_config()
     sources = parse_context_sources(context) if sources is None else sources
     n_sources = max((s["n"] for s in sources),default=0)
-    body = _generate(build_report_prompt(query,context, cfg=cfg),cfg,step="正文",temperature=BODY_TEMPERATURE)
+    body = _generate(build_report_prompt(query,context, cfg=cfg,extra=extra_instructions),
+                     cfg,step="正文",temperature=BODY_TEMPERATURE)
     body = _clean_report(body,drop_conclusion=with_conclusion)
+    if with_introduction:
+        intro = _generate_optional(
+            report_introduction_prompt(query, context, max_source=n_sources),
+            cfg,
+            step="引言",
+        )
+        if intro:
+            body = _insert_introduction(
+                body, _drop_h1(_clean_report(intro, drop_conclusion=False))
+            )
+
+    if with_conclusion:
+        conclusion = _generate_optional(
+            report_conclusion_prompt(query, body), cfg, step="结论"
+        )
+        if conclusion:
+            conclusion = _drop_h1(_clean_report(conclusion, drop_conclusion=True))
+            conclusion = _CONC_HEADING.sub("", conclusion).strip()
+            if conclusion:
+                body = body.rstrip() + "\n\n## 结论\n\n" + conclusion
+
+    return add_references(body, sources)
+def write_body(
+        query:str,
+        context:str,
+        *,
+        cfg: Config | None = None,
+        extra_instructions:str="",
+        drop_conclusion: bool = True,
+) ->str:
+    """只写正文 不含引言/结论/文献
+
+    为什么单独抽出来，多轮编辑部每轮都要重写正文，但引言和结论只有收工时才有意义
+    中间轮写完就被下一轮覆盖。
+     drop_conclusion 默认 True：正文里模型自己写的结论要砍掉，
+    因为收工时 add_side_sections 会补一个（阶段 6 的老用法传 with_conclusion，
+    行为与拆分前完全一致）
+    """
+    cfg = cfg or load_config()
+    body = _generate(build_report_prompt(query, context, cfg=cfg,extra=extra_instructions),cfg,step="正文",temperature=BODY_TEMPERATURE)
+    return _clean_report(body,drop_conclusion=drop_conclusion)
+
+def add_side_sections(
+        body:str,
+        query:str,
+        context:str,
+        sources:list[dict[str, Any]],
+        *,
+        cfg: Config | None = None,
+        with_introduction: bool = True,
+        with_conclusion: bool = True,
+) -> str:
+    """在一篇已有正文上补引言/结论/参考文献，返回完整报告。"""
+
+    cfg = cfg or load_config()
+    n_sources = max((s["n"] for s in sources),default=0)
     if with_introduction:
         intro = _generate_optional(
             report_introduction_prompt(query, context, max_source=n_sources),

@@ -60,10 +60,16 @@ def search_queries_prompt(query:str,max_queries:int=4)->str:
    不要为了凑数而生成泛泛而谈的查询。
 """
 
-def report_prompt(query: str, context: str, *, total_words: int = 1000, max_source: int = 0) -> str:
-    """阶段 6 正文提示词。对照源码：gpt_researcher/prompts.py:262"""
+def report_prompt(query: str, context: str, *, total_words: int = 1000, max_source: int = 0,extra:str="") -> str:
+    """阶段 6 正文提示词。对照源码：gpt_researcher/prompts.py:262
+
+    extra:阶段9用，上一轮评审提出的缺口，追加在写作要求后面 用来把上一轮评审意见喂给写作者
+    """
     today = datetime.now(timezone.utc).strftime("%Y 年 %m 月 %d 日")
     range_hint = f"（只能是 1 到 {max_source}）" if max_source else "（见上面资料）"
+    extra_block = ""
+    if extra:
+        extra_block = f"\n补充要求（必须逐条正面处理）：\n{extra}\n"
     return f"""请仅根据下面提供的资料，就下面的研究任务写一篇详细的报告。
 
 研究任务："{query}"
@@ -86,6 +92,7 @@ def report_prompt(query: str, context: str, *, total_words: int = 1000, max_sour
 9. 全文约 {total_words} 字，力求详尽，把资料里有价值的信息都用上。
 10. 要有明确的判断和取舍，不要写"各有优劣""取决于具体情况"这种不表态的话。
 11. 用与"研究任务"相同的语言写作。
+{extra_block}
 假设当前日期是 {today}。
 """
 
@@ -123,4 +130,55 @@ def report_conclusion_prompt(query: str, report: str) -> str:
 3. 只能依据报告里已有的内容，不要引入新事实；可以直接复用报告里的 [编号] 角标。
 4. 不要写"参考文献"章节。
 5. 用与"研究任务"相同的语言写作。
+"""
+
+def reviewer_prompt(query: str, report: str, context: str, *,
+                    round_no: int, max_rounds: int,
+                    previous_gaps: list[str] | None = None) -> str:
+    """阶段 9 评审者。对照源码：multi_agents/ 的评审角色。
+
+    三分类是这版的核心：missing 会长成下一轮的检索词，所以只有"真能搜回来"的
+    才配进 missing。把"资料里没有的数据"记成 missing，等于让研究者去找不存在的东西。
+    """
+    prev_block = ""
+    if previous_gaps:
+        prev_block = (
+            "\n上一轮你提过的缺口（研究者已经针对它们做过一轮检索）：\n"
+            + "\n".join(f"{i}. {g}" for i, g in enumerate(previous_gaps, 1))
+            + "\n如果某条缺口本轮资料里**仍然**没有对应信息，那它就不是"
+              "\"检索没做够\"，而是资料边界 —— 请放进 unfixable，不要重复放进 missing。\n"
+        )
+    return f"""你是这份研究报告的评审者。只做评审，不要重写报告。
+
+研究任务："{query}"
+
+报告草稿：
+{report}
+
+报告可用的全部资料（带 [编号]，报告只能引用这些编号）：
+{context}
+{prev_block}
+这是第 {round_no} 轮，最多 {max_rounds} 轮。请检查并**分类**：
+
+1. unsupported：报告里哪些话是资料支撑不了的？引用编号越界、把资料没说的当事实写、
+   把"初步验证"写成"已验证"这类强度放大的都算。
+2. missing：哪些缺口是"再检索一轮就有机会补上"的？每条一句话，必须具体到能当检索词用，
+   最多 3 条。不要写"可以更详细"这种没法执行的意见。
+3. unfixable：哪些是资料里根本没有、再检索也大概率补不上的？
+   （典型：某类对照实验根本没被公开做过、某个指标没有实测数据、某个机制没有公开讨论。）
+   这类**不要**放进 missing。对每一条，说明"报告应该怎样如实声明这个边界"。
+4. 有没有自相矛盾、或者该表态却写"各有优劣""取决于具体情况"的地方？记进 missing。
+
+只输出一个 JSON 对象，不要任何其他内容：
+{{"pass": true, "score": 8, "missing": [], "unsupported": [], "unfixable": []}}
+
+pass 的判定（三条**同时**满足才写 true）：
+- unsupported 为空；
+- missing 为空；
+- unfixable 里的每一条，报告都已经在正文或局限里如实写明了 —— 要写清"现有资料无法回答
+  什么、为什么无法判断"，只写"资料未覆盖"四个字不算。
+
+注意：missing 会长成下一轮的检索词。把"资料没有提供公平对比数据"记成 missing，
+下一轮就会去搜一个不存在的东西，白烧一轮的钱 —— 这种应该进 unfixable，
+并要求报告写明为什么无法比较。
 """
