@@ -383,3 +383,4 @@ def save_report(query: str, report: str, *, out_dir: str | Path = "outputs") -> 
     path = out / f"{stamp}-{slug}.md"
     path.write_text(report, encoding="utf-8")
     return path
+

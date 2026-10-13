@@ -276,14 +276,38 @@ def cmd_research(args: argparse.Namespace) -> int:
     return 0
 
 def cmd_agents(args:argparse.Namespace) -> int:
-    """阶段9：多Agent编辑部 / 阶段10：可选的人审提纲"""
+    """阶段9：多Agent编辑部 / 阶段10：可选的人审提纲 / 阶段11：可选的事实核查"""
     from agents import run_editorial
     ask = input if args.human else None
     if ask is None:
         print("（未开人审：加 --human 可以在拆完提纲后先看一遍再开始跑）")
+    if args.fact_check:
+        print("（已开事实核查：每轮写完后由核查员逐句核对引用有没有依据）")
     result = run_editorial(
-        args.query, cfg=load_config(), max_rounds=args.rounds, ask=ask
+        args.query,
+        cfg=load_config(),
+        max_rounds=args.rounds,
+        ask=ask,
+        with_fact_check=args.fact_check,
     )
+    print(result["report"])
+    for h in result.get("history", []):
+        verdict = h.get("verdict") or {}
+        fact = h.get("fact") or {}
+        fact_note = ""
+        if h.get("fact") is not None:
+            fact_note = f"  核查={'过' if fact.get('passed') else '不过'}"
+        print(
+            f"  第 {h.get('round')} 轮  目标 {len(h.get('targets') or [])} 条"
+            f"  证据 {h.get('pages_total')} 页"
+            f"  评审={'过' if verdict.get('passed') else '不过'}{fact_note}"
+        )
+    if result.get("path"):
+        print(f"\n（已写入 {result['path']}，共 {result.get('rounds')} 轮）")
+    if result.get("cost_report"):
+        print("\n" + "-" * 60)
+        print(result["cost_report"])
+    return 0
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="mini-gpt-researcher")
@@ -330,6 +354,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--human",
         action="store_true",
         help="阶段 10：拆完提纲后停下来等人确认（回车接受 / n 打回 / e 自己改）",
+    )
+    p.add_argument(
+        "--fact-check",
+        action="store_true",
+        help="阶段 11：每轮写完后让事实核查员逐句核对引用有没有依据（每轮多一次模型调用）",
     )
     p.set_defaults(func=cmd_agents)
     return parser

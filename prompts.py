@@ -134,12 +134,32 @@ def report_conclusion_prompt(query: str, report: str) -> str:
 
 def reviewer_prompt(query: str, report: str, context: str, *,
                     round_no: int, max_rounds: int,
-                    previous_gaps: list[str] | None = None) -> str:
+                    previous_gaps: list[str] | None = None,
+                    fact_check_on:bool = False) -> str:
     """阶段 9 评审者。对照源码：multi_agents/ 的评审角色。
 
     三分类是这版的核心：missing 会长成下一轮的检索词，所以只有"真能搜回来"的
     才配进 missing。把"资料里没有的数据"记成 missing，等于让研究者去找不存在的东西。
+    阶段 11：多了个 fact_check_on 开关。
+    开了事实核查之后，评审者不再报 unsupported —— 那一项由核查员逐句核对（它才是
+    干这个的）。这不是"少干点活"，是分工：同一件事让两个角色各说一遍，等于付两次钱，
+    而且两份意见措辞不同、写作者还得自己判断是不是一回事。
+    关掉核查时必须退回去自己报 —— 否则关了开关就没有任何一道关在管"无据"，那是净损失。
     """
+    item_unsupported = (
+        """1. unsupported：**留空**。逐句核对「这句话引的资料里到底有没有这个说法」由事实核查员负责，
+   他已经在做了（阶段 11 的 --fact-check）—— 你重复报一遍，等于同一件事付两次钱。
+   只有「论断强度放大」这类**结构**问题（把资料里的“初步验证”写成“已经验证”）
+   才请你写进 missing。"""
+        if fact_check_on
+        else """1. unsupported：报告里哪些话是资料支撑不了的？引用编号越界、把资料没说的当事实写、
+       把“初步验证”写成“已验证”这类强度放大的都算。"""
+    )
+    pass_line_unsupported = (
+        "- unsupported 为空（这条由事实核查员保证，你留空即可）；"
+        if fact_check_on
+        else "- unsupported 为空；"
+    )
     prev_block = ""
     if previous_gaps:
         prev_block = (
@@ -160,8 +180,7 @@ def reviewer_prompt(query: str, report: str, context: str, *,
 {prev_block}
 这是第 {round_no} 轮，最多 {max_rounds} 轮。请检查并**分类**：
 
-1. unsupported：报告里哪些话是资料支撑不了的？引用编号越界、把资料没说的当事实写、
-   把"初步验证"写成"已验证"这类强度放大的都算。
+{item_unsupported}
 2. missing：哪些缺口是"再检索一轮就有机会补上"的？每条一句话，必须具体到能当检索词用，
    最多 3 条。不要写"可以更详细"这种没法执行的意见。
 3. unfixable：哪些是资料里根本没有、再检索也大概率补不上的？
@@ -173,7 +192,7 @@ def reviewer_prompt(query: str, report: str, context: str, *,
 {{"pass": true, "score": 8, "missing": [], "unsupported": [], "unfixable": []}}
 
 pass 的判定（三条**同时**满足才写 true）：
-- unsupported 为空；
+{pass_line_unsupported}
 - missing 为空；
 - unfixable 里的每一条，报告都已经在正文或局限里如实写明了 —— 要写清"现有资料无法回答
   什么、为什么无法判断"，只写"资料未覆盖"四个字不算。
@@ -181,4 +200,44 @@ pass 的判定（三条**同时**满足才写 true）：
 注意：missing 会长成下一轮的检索词。把"资料没有提供公平对比数据"记成 missing，
 下一轮就会去搜一个不存在的东西，白烧一轮的钱 —— 这种应该进 unfixable，
 并要求报告写明为什么无法比较。
+"""
+
+def fact_checker_prompt(query:str,report:str,context:str)->str:
+    """
+    阶段11 实时核查员
+    和评审员的边界 两边提示词必须对的上 否则两个角色会重复干活
+    核查员：逐句 核对 这句话引的资料里到底有没有这个说法 ——只输出无据论断
+    评审员：结构、资料覆盖、该表态却含糊 只输出缺口、边界、自相矛盾
+    所以这里只给 pass 和 unsupported 两个字段：多给一个，模型就会往里塞东西，
+    然后同一批意见在两条线上各报一遍。
+    """
+    return f"""你是这份研究报告的事实核查员。只核对，不要重写报告。
+
+研究任务："{query}"
+报告草稿:
+{report}
+报告可用的全部资料（带 [编号]，报告只能引用这些编号）：
+{context}
+
+你要做的只有一件事：逐句检查报告里的事实性陈述，找出**资料不支持**的那些。
+一条一条对着上面资料看，下面几种都算"不支持"：
+
+1. 引用的编号越界（报告里写了 [7]，资料只到 [5]）。
+2. 引用的编号存在，但那条资料里根本没有这句话说的内容。
+3. 资料没说过、却被写成事实的（包括把资料里的"可能/预计"写成"是/已经"）。
+4. 数字、日期、名称、版本号与资料对不上。
+
+不归你管的（看到了也不要写进来）：结构问题（哪一节太薄、顺序不好）、
+资料覆盖全不全面、报告该不该下某个结论 —— 那些是评审员的活。
+
+只输出一个 JSON 对象，不要任何其他内容：
+{{"pass": true, "unsupported": []}}
+
+事实都对上就是上面这样；有问题的长这样：
+{{"pass": false, "unsupported": ["报告第 2 段写"深度研究代理占 60% 份额"，引的是 [3]，但 [3] 全文没有这个数字"]}}
+
+规则：
+- 一条无据论断一句话，必须写清**哪句话、引的哪个编号、资料里实际是什么**，
+  否则写作者不知道该改哪里。最多 8 条。
+- 只写你**核对过**的，拿不准的宁可不写 —— 误报会让写作者把对的删掉。
 """

@@ -72,6 +72,11 @@ class ResearchState:
     history:list[dict[str,Any]]=field(default_factory=list)
     previous_verdict:Verdict | None=None
     gap_tries:dict[str,int] = field(default_factory=dict) #缺口-》已检索次数
+    #: 阶段 11：这次运行是否开事实核查。
+    #: 为什么挂在 state 上、而不是当参数一层层往下传：写作者/评审者/核查员读的是
+    #: 同一份共享状态，运行配置也该在那一份里 —— 这正是"角色靠状态通信"的意思，
+    #: 参数传递是"函数 A 调函数 B"的耦合方式。顺带还护住了各角色的函数签名。
+    fact_check_on:bool = False
 
 def _fingerprint(text:str)->str:
     return hashlib.sha1((text or "").encode("utf-8")).hexdigest()[:12]
@@ -167,9 +172,10 @@ REVIEW_MAX_TOKENS = 4000
 def review_draft(state:ResearchState,cfg:Config)->Verdict:
     """评审者:给当前草稿打分并提出可执行的缺口"""
     from pipeline import parse_json
-    prompt = reviewer_prompt(state.question,state.draft,state.evidence,round_no=state.rounds,max_rounds=state.max_rounds,previous_gaps=state.open_questions or None)
+    prompt = reviewer_prompt(state.question,state.draft,state.evidence,round_no=state.rounds,
+                             max_rounds=state.max_rounds,previous_gaps=state.open_questions or None,
+                             fact_check_on=state.fact_check_on)
     try:
-
         raw = chat(
             [{"role":"user","content":prompt}],
             cfg=cfg,
@@ -247,26 +253,65 @@ def _normalize_verdict(parsed:Any,raw:str)->Verdict:
     if not isinstance(score,int) or isinstance(score,bool):
         score = 0
     return Verdict(bool(passed),score,_as_list("missing"), _as_list("unsupported"),_as_list("unfixable"))
+def _merge_verdicts(review:Verdict,fact:Verdict | None)->Verdict:
+    """把评审者和事实核查员的两份裁决合成一份给编排器用。
 
+    为什么要合成而不是各判各的：循环里只有一个"通过"信号，两个角色各说一句
+    "我通过了"，编排器就得同时盯两个变量，终止条件会写成一团。
+    合成之后"通过"只有一种含义：结构过关**且**事实过关。
+
+    合并规则（这就是"分工"落到代码上的样子）：
+      passed      —— 两个都通过才算通过；
+      missing     —— 只认评审者：它是唯一知道"再检索一轮有没有机会补上"的角色；
+      unfixable   —— 只认评审者；
+      unsupported —— 取并集，但事实核查员是主力（开了核查之后评审员这一项留空，
+                     见 reviewer_prompt 的 fact_check_on 分支），所以并集不会重复。
+
+    还有一条兜底：核查员说"未通过"却一条无据论断都没给 —— 这条意见没法执行。
+    采信它等于让写作者每轮原样重写一遍同样的正文，直到把轮数烧完。
+    上游是用 MaxFactCheckRevisionsExceededError 兜住这种情况、由编排器接住当 accept；
+    我们这里就地降级成放行 —— 同一个意思，少一个异常类和一个 try。
+    """
+    if fact is None:
+        return review
+    if not fact.passed and not fact.unsupported:
+        logger.warning(
+            "事实核查判未通过，却没给出任何无据论断（unsupported 为空）——"
+            "这条意见无法执行，按放行处理（否则每轮都会原样重写直到烧完轮数）"
+        )
+        fact = Verdict(passed=True)
+    unsupported = list(dict.fromkeys([*review.unsupported,*fact.unsupported]))
+    return Verdict(
+        passed=review.passed and fact.passed,
+        score=review.score,
+        missing=list(review.missing),
+        unsupported=unsupported,
+        unfixable=list(review.unfixable),
+    )
 def run_editorial(
         question:str,
         *,
         cfg:Config | None=None,
         max_rounds:int=MAX_ROUND_DEFAULT,
         ask:Callable[[str],str] | None=None,
+        with_fact_check:bool=False,
 )->dict[str,Any]:
     """编排器：唯一的循环，每轮调度 研究者-》写作者-》评审者
     对照源码：上游 multi_agents 的编排入口 + skills/researcher.py:97 的主循环。
 
     阶段 10：ask 是注进来的"问人"函数（命令行传 input）。ask=None 表示没人审，
     拆完提纲直接开跑；给上 ask 就变成 拆提纲 -> 人审 -> （打回就重拆）-> 开跑。
+     阶段 11：with_fact_check=True 时，每轮评审完再加一道事实核查，
+    两份裁决合成一份再交给下一轮的写作者。默认关 —— 开一次核查就是每个写轮
+    多一次模型调用，值不值由用的人决定（命令行 --fact-check）。
     """
     from pipeline import _collect_pages,_cost_report_hook,plan_research
     from plan_review import review_plan
     from report import  save_report
-
+    if with_fact_check:
+        from fact_checker import check_facts
     cfg = cfg or load_config()
-    state = ResearchState(question=question,max_rounds=max_rounds)
+    state = ResearchState(question=question,max_rounds=max_rounds,fact_check_on=with_fact_check)
     state.sub_queries = review_plan(question,cfg=cfg,ask=ask)
 
     while state.rounds < max_rounds:
@@ -324,15 +369,29 @@ def run_editorial(
             logger.warning("写作者这一轮产出为空，停止")
             break
 
-        #---评审者
-        verdict = review_draft(state,cfg=cfg)
-        state.history.append({
-            "round": state.rounds,
-            "targets": list(targets),
-            "pages_total": len(state.pages),
-            "draft_sha":_fingerprint(state.draft),
-            "verdict":verdict.as_dict()
-        })
+        #---评审者(结构、缺口、边界）
+        review = review_draft(state, cfg)
+        #---事实核查员 （阶段11 可选：逐句核对引用有没有依据）
+        fact = check_facts(state,cfg) if with_fact_check else None
+        if fact is not None:
+            logger.info(
+                "第 %d 轮事实核查：pass=%s 无据 %d 条",
+                state.rounds,
+                fact.passed,
+                len(fact.unsupported),
+            )
+        verdict = _merge_verdicts(review, fact)
+        state.history.append(
+            {
+                "round": state.rounds,
+                "targets": list(targets),
+                "pages_total": len(state.pages),
+                "draft_sha": _fingerprint(state.draft),
+                "verdict": verdict.as_dict(),
+                # 两份裁决分开留痕：合成之后看不出是谁提的，排错时会抓瞎
+                "fact": fact.as_dict() if fact is not None else None,
+            }
+        )
         state.previous_verdict = verdict
         state.open_questions = verdict.missing
         logger.info(
@@ -352,11 +411,11 @@ def run_editorial(
             #重写产出一摸一样，说明模型卡住了，再跑只是烧钱
             logger.warning("本轮草稿与上一轮完全相同，继续重写不会变好，提前收工")
             break
-        if not verdict.missing:
+        if not (verdict.missing or verdict.unsupported):
             state.blind_retries += 1
             if state.blind_retries > 1:
                 logger.warning(
-                    "评审连续两轮没给出可执行的缺口，停止（报告可能仍有问题）"
+                    "连续两轮的裁决都没给出可执行的修改意见（缺口、无据都是空的），停止（报告可能仍有问题）"
                 )
                 break
         if state.rounds > 1 and not targets and state.open_questions:
