@@ -116,6 +116,10 @@ class Config:
     #这里有爬取正文的事-所以和爬虫有关
     scrape_timeout: int = _env_int("SCRAPE_TIMEOUT", 15)
     scrape_max_chars: int = _env_int("SCRAPE_MAX_CHARS", 12000)
+    #: 单个响应体的字节上限（阶段 12）。PDF 十几 MB 很常见，而 Content-Length
+    #: 是服务器说了算的 —— 读取时按这个上限叫停（见 scrape._read_body）。
+    scrape_max_bytes: int = _env_int("SCRAPE_MAX_BYTES", 30 * 1024 * 1024)
+    
     # 检索器的 HTTP 超时
     request_timeout: int = _env_int("REQUEST_TIMEOUT", 15)
     def show(self) -> str:

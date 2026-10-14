@@ -28,6 +28,9 @@ import logging
 import re
 import requests
 from bs4 import BeautifulSoup
+from urllib.parse import urljoin
+
+from url_security import HostNotResolvable, UnsafeURLError, validate_url
 logger = logging.getLogger(__name__)
 
 DEFAULT_UA = (
@@ -66,17 +69,7 @@ BLOCK_TAGS = (
 )
 
 MIN_CONTENT_CHARS = 300
-#-----------健康检查
-def _looks_like_unextracted_pdf(content_type:str,body:bytes)->str | None:
-    """响应体不是网页(PDF/二进制)时给出原因
-    原项目在这里分派给专门的PDF解析器，我们本阶段不支持，如实报错
 
-    """
-    if body[:5] == b"%PDF":
-        return "PDF文件 本阶段不支持抽取"
-    if "application/pdf" in (content_type or "").lower():
-        return "Content-Type 是PDF，未抽取文字"
-    return None
 def _looks_like_block_page(text:str)->str|None:
     """拦截页/验证页的典型特征
     只在文本很短时才查关键词
@@ -202,6 +195,150 @@ def _decode(resp: requests.Response) -> str:
     if declared and declared not in ("iso-8859-1", "ascii", "latin-1"):
         return resp.text
     return resp.content.decode(resp.apparent_encoding or "utf-8", errors="replace")
+
+# ==================== 阶段 12：SSRF 防护 + PDF 正文抽取 ====================
+#单个响应体的硬上限（字节） Content-Type 和 Content-Length 都是服务器说了算，
+#: 只有这个是本地说了算的 —— 所以字节也得自己数（见 _read_body）。
+DEFAULT_MAX_BODY_BYTES = 30 * 1024 * 1024
+#: 最多跟几跳重定向。requests 默认 30 跳，对研究场景太宽松。
+MAX_REDIRECTS = 5
+#: PDF 的内部结构标记。它们本身也是 ASCII，所以在"被当成网页解出来的垃圾文本"里
+#: 同样找得到 —— 但真实散文里几乎不会同时出现三个，所以≥3 个就能认定是 PDF 语法。
+_PDF_MARKER_BYTES = (b"endobj", b"endstream", b"/FlateDecode", b"xref", b"trailer")
+
+def _pymupdf():
+    """拿到PyMuPDF import名是fitz模块 没装返回 None
+     为什么不用上游那套 langchain_community.PyMuPDFLoader：为了"逐页取文本"
+    这一件事要拖进整条 langchain 依赖链。直接调 fitz 是十几行。
+    """
+    try:
+        import fitz
+    except ImportError:
+        return None
+    return fitz
+
+def _pdf_confidence(body:bytes)->int:
+    """0=不像PDF,1=结构标记像，2=文件头，板上钉钉
+    为什么分两档：字节里出现 PDF 的内部语法（endobj/xref/trailer）还有另一种
+    可能 —— 这是一篇**讲 PDF 格式的文章**，正文里就写着这些词。
+    所以标记只能算"像"，只有 %PDF- 文件头才算"是"。
+    这个区分决定了解析失败时是"报错"还是"退回按网页解析"，见 fetch。
+
+    """
+    if body[:5] == b"%PDF-":
+        return 2
+    hits = sum(1 for marker in _PDF_MARKER_BYTES if marker in body)
+    return 1 if hits >= 3 else 0
+
+def _sniff(content_type:str,confidence:int)->str:
+    """这批字节该按哪种文档解析？返回 'pdf' / 'html' / 'binary'。
+
+    顺序是有讲究的：先看字节（服务器改不了），再看 Content-Type（服务器说了算）。
+    这里**故意不看 .pdf 后缀** —— 后缀是最弱也最容易撒谎的信号（一个路由就能
+    叫 /x.pdf），而真 PDF 的文件头或 application/pdf 总有一个会中。
+    上游是多一层"后缀选抓取器 + 文本兜底重抓"，我们把判断做在字节上，一层就够。
+    """
+    if confidence:
+        return "pdf"
+    ctype = (content_type or "").lower()
+    if "application/pdf" in ctype:
+        return "pdf"
+    if ctype and not any(k in ctype for k in ("html", "xml", "text")):
+        return "binary"
+    return "html"
+
+def _extract_pdf(body:bytes,fitz) ->tuple[str,str,str | None]:
+    """
+    pdf 字节 ——》 （标题、正文、失败原因） 失败原因非None 表示没抽出来。
+    逐页全取 、标题只从metadata拿。
+    取所有页面。
+    论文首页通常只有标题和作者，只取第一页会得到几十字的正文
+    然后被正文过短的健康检查判死
+
+    :param body:
+    :param fitz:
+    :return:
+    """
+    try:
+        doc = fitz.open(stream=body,filetype="pdf")
+    except Exception as exc:
+        return "", "", f"{type(exc).__name__}: {str(exc)[:120]}"
+
+    try:
+        if not getattr(doc,"is_pdf",True):
+            #PyMuPDF 是对非PDF字节是宽容的，一段HTML也能打开成功
+            return "","","内容不是PDF （PyMuPDF 识别为 %s)" %(
+            (doc.metadata or {}).get("format") or "未知格式"
+            )
+        if getattr(doc, "needs_pass", False):
+            return "", "", "文档已加密，需要密码"
+        pages = [page.get_text("text",sort=True) for page in doc]
+        title = (doc.metadata or {}).get("title") or ""
+        return str(title).strip(),"\n".join(pages),None
+    except Exception as exc:
+        return "", "", f"抽文字失败 {type(exc).__name__}: {str(exc)[:120]}"
+    finally:
+        doc.close()
+
+def _read_body(resp,*,max_bytes:int)->bytes:
+    """流式读响应体，超过上限当场教廷
+    为什么不用 resp.content：那是无条件的一次性全量读取。服务器可以把
+    Content-Length 写成 1KB 然后推 2GB，也可以用 chunked 干脆不写长度 ——
+    前者我们能从声明里看出苗头，后者只能在读的过程中发现。所以两条都要查。
+    """
+    declared = (resp.headers.get("Content-Length") or "").strip()
+    if declared.isdigit() and int(declared) > max_bytes:
+        raise ValueError(f"响应体过大（声明 {int(declared)} 字节 > 上限 {max_bytes}）")
+    chunks:list[bytes] = []
+    total = 0
+    for chunk in resp.iter_content(chunk_size=65536): #用流式读 而不是读完整的
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > max_bytes:
+            raise ValueError(f"响应体过大（已读 {total} 字节 > 上限 {max_bytes}）")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+def _body_response(body:bytes,content_type:str,*,url:str="")->requests.Response:
+    """把已经读下来的字节包装成一个最小的Response
+    为什么不另写一份"从 bytes 判编码"：GBK 被声明成 ISO-8859-1、声明整个缺失
+    这些坑踩过一次就够了，两份实现迟早会分叉 —— _decode 里用的是
+    resp.encoding + resp.apparent_encoding 这套 requests 自己的判定。
+    """
+    fake = requests.Response()
+    fake.status_code = 200
+    fake.url = url
+    fake.headers["Content-Type"] = content_type or ""
+    fake._content = (
+        body  # 私有属性；requests 自己也拿它当缓存，见 check_decode.py 同样的做法
+    )
+    fake.encoding = requests.utils.get_encoding_from_headers(fake.headers)
+    return fake
+
+def _get_safely(client, url: str, *, headers: dict, timeout: float):
+    """带逐跳校验的 GET，返回最终那一跳的响应。
+
+    为什么不用 allow_redirects=True：requests 只认第一跳。一个公网 URL
+    302 到 http://169.254.169.254/ 它就照跳，SSRF 防护形同虚设。
+    所以这里关掉自动跳转，自己一跳一跳地校验（顺手限制跳数）。
+    每一跳都过 validate_url —— 这才是"外部给的 URL 一律不信任"。
+    """
+    current = url
+    for _ in range(MAX_REDIRECTS + 1):
+        validate_url(current)
+        resp = client.get(
+            current, headers=headers, timeout=timeout,
+            allow_redirects=False, stream=True,
+        )
+        location = resp.headers.get("Location")
+        if resp.status_code in (301, 302, 303, 307, 308) and location:
+            resp.close()
+            current = urljoin(current, location)   # Location 可能是相对路径
+            continue
+        return resp
+    raise UnsafeURLError(f"重定向超过 {MAX_REDIRECTS} 跳，放弃")
+
 def fetch(url: str, *, cfg: Config | None = None,session:requests.Session |None = None) -> dict[str, Any]:
     """抓一个 URL，返回 {url, title, raw_content}。
     返回 {"url", "title", "raw_content", "ok", "reason", "status"}。
@@ -216,6 +353,10 @@ def fetch(url: str, *, cfg: Config | None = None,session:requests.Session |None 
          用 "\n".join(line.strip() for line in text.splitlines() if line.strip()) 压掉空行
       6. 加三个健康检查：正文太短(< 200 字) / 像验证码页 / 像词表 -> 视为抓取失败
       7. 任何异常都返回 raw_content=""，别让一个坏链接炸掉整轮研究\
+
+    阶段 12 的两件事：
+      1. 请求之前、以及**每一次重定向之前**都过一遍 SSRF 校验（见 url_security）；
+      2. 拿回来的是 PDF 就抽正文，而不是当成"不支持的格式"丢掉。
     """
     #1. requests.get(url, timeout=cfg.scrape_timeout, headers={"User-Agent": ...})
     cfg = cfg or load_config()
@@ -228,8 +369,17 @@ def fetch(url: str, *, cfg: Config | None = None,session:requests.Session |None 
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
     }
     client = session or requests
+    max_bytes = getattr(cfg, "scrape_max_bytes", DEFAULT_MAX_BODY_BYTES)
+
     try:
-        resp = client.get(url, headers=headers,timeout=cfg.scrape_timeout,allow_redirects=True)
+        resp = _get_safely(client, url, headers=headers, timeout=cfg.scrape_timeout)
+    except HostNotResolvable as exc:
+        out["reason"] = f"域名解析失败：{exc}"
+        out["transient"] = True  # DNS 抽风是暂时的，别写进负缓存
+        return out
+    except UnsafeURLError as exc:
+        out["reason"] = f"拒绝不安全的 URL：{exc}"
+        return out  # 不是 transient：重试一万次它还是内网地址
     except requests.Timeout:
         out["reason"] = f"超时（>{cfg.scrape_timeout}s）"
         out["transient"] = True
@@ -238,48 +388,75 @@ def fetch(url: str, *, cfg: Config | None = None,session:requests.Session |None 
         out["reason"] = f"网络错误：{type(exc).__name__}: {str(exc)[:150]}"
         out["transient"] = True
         return out
+    try:
 
-    out["status"] =resp.status_code
-    out["url"] = resp.url
+        out["status"] =resp.status_code
+        out["url"] = resp.url or url
+        ctype = resp.headers.get("Content-Type") or ""
+        try:
+            body = _read_body(resp,max_bytes=max_bytes)
+        except ValueError as exc:
+            out["reason"] = str(exc)
+            return out
+        if resp.status_code >= 400:
+            out["reason"] = f"HTTP {resp.status_code}"
+            return out
 
-    #1.检查:是否是网页
-    reason = _looks_like_unextracted_pdf(
-        resp.headers.get("Content-Type", ""), resp.content
-    )
-    if reason:
-        out["reason"] = reason
-        return out
-    if resp.status_code >= 400:
-        out["reason"] = f"HTTP {resp.status_code}"
-        return out
+        #决定按哪种文档解析
+        confidence = _pdf_confidence(body)
+        kind = _sniff(ctype,confidence)
+        if kind == "binary":
+            out["reason"] = f"非网页内容（Content-Type: {ctype.split(';')[0].strip()}）"
+            return out
+        used_pdf = False
+        if kind == "pdf":
+            fitz_mod = _pymupdf()
+            if fitz_mod is None:
+                # 装完依赖再跑就行 —— 算 transient，别写进负缓存
+                out["reason"] = "这是 PDF，但没装 pymupdf（pip install pymupdf）抽不了文字"
+                out["transient"] = True
+                return out
+            title, text, err = _extract_pdf(body, fitz_mod)
+            if err is None:
+                used_pdf = True
+            elif confidence == 2:
+                # 文件头就是 %PDF-：抽不出来就是抽不出来，不许退回当网页糊过去
+                out["reason"] = f"PDF 抽取失败：{err}"
+                return out
+            else:
+                # 只有结构标记像：大概率是"讲 PDF 格式的文章"，按网页解才对
+                logger.info("字节里有 PDF 结构标记但不是文件头（%s），按网页解析：%s",
+                            err, resp.url)
+        if not used_pdf:
+            title, text = _parse_html(
+                _decode(_body_response(body, ctype, url=resp.url or url))
+            )
+        text = _clean_lines(text)
+        out["title"] = title
+        if used_pdf and not text:
+            out["reason"] = "PDF 里没有可抽取的文字（可能是扫描件，本阶段不做 OCR）"
+            return out
 
-    ctype = (resp.headers.get("Content-Type") or "").lower()
-    if ctype and not any(k in ctype for k in ("html", "xml", "text")):
-        out["reason"] = f"非网页内容（Content-Type: {ctype.split(';')[0]}）"
-        return out
+        #检查可能是拦截
+        reason = _looks_like_block_page(text)
+        if reason:
+            out["reason"] = reason
+            return out
+        #检查可能是一堆孤立的短行
+        if _looks_like_word_list(text):
+            out["reason"] = "疑似导航/标签云，未取到正文"
+            return out
 
-    title,text = _parse_html(_decode(resp))
-    text = _clean_lines(text)
-    out["title"] = title
-
-    #检查可能是拦截
-    reason = _looks_like_block_page(text)
-    if reason:
-        out["reason"] = reason
+        # 检查 4：太短，没有信息量
+        if len(text) < MIN_CONTENT_CHARS:
+            out["reason"] = f"正文过短（{len(text)} 字符）"
+            return out
+        #填充信息
+        out["raw_content"] = _truncate(text, cfg.scrape_max_chars)
+        out["ok"] = True
         return out
-    #检查可能是一堆孤立的短行
-    if _looks_like_word_list(text):
-        out["reason"] = "疑似导航/标签云，未取到正文"
-        return out
-
-    # 检查 4：太短，没有信息量
-    if len(text) < MIN_CONTENT_CHARS:
-        out["reason"] = f"正文过短（{len(text)} 字符）"
-        return out
-    #填充信息
-    out["raw_content"] = _truncate(text, cfg.scrape_max_chars)
-    out["ok"] = True
-    return out
+    finally:
+        resp.close()
 
 
 def fetch_many(urls: list[str], *, cfg: Config | None = None) -> list[dict[str, Any]]:
