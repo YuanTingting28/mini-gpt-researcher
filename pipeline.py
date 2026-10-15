@@ -388,7 +388,8 @@ def _cost_report_hook(cfg: Config) -> str:
     except NotImplementedError:
         return "（成本统计属于阶段 7，尚未实现）"
 
-def full_research(query: str, *, cfg: Config | None = None) -> dict[str, Any]:
+def full_research(query: str, *, cfg: Config | None = None,
+                  curate:bool | None=None) -> dict[str, Any]:
     """阶段 8：完整链路，落盘到 outputs/。
     阶段 8：拆子问题 -> 并发检索 -> 全局去重 -> 并发抓取 -> 一次压缩 -> 成稿落盘。
 
@@ -409,6 +410,20 @@ def full_research(query: str, *, cfg: Config | None = None) -> dict[str, Any]:
     cfg = cfg or load_config()
     sub_queries = plan_research(query,cfg=cfg)
     pages = _collect_pages(sub_queries,cfg=cfg)
+    #阶段13 抓完先让来源管家筛选一边，再进入压缩
+    curation:dict[str,Any] | None = None
+    if curate is None:
+        curate = cfg.curate_sources
+    if curate and pages:
+        from curator import curate_pages
+        curation = curate_pages(query,pages,cfg=cfg)
+        if curation["ok"]:
+            logger.info("来源管家：保留 %d/%d 篇", len(curation["pages"]), len(pages))
+        else:
+            # 局部失败降级：筛不成不是错误，退回未筛选接着跑（见 curator.py 抬头的理由）
+            logger.warning("来源管家没筛成，按未筛选继续：%s", curation["reason"])
+        pages = curation["pages"]
+
     if not pages:
         # 全局失败停下，但要把原因说清楚（局部失败才降级）
         logger.warning("一个页面都没抓到，不出报告")
@@ -418,6 +433,7 @@ def full_research(query: str, *, cfg: Config | None = None) -> dict[str, Any]:
             "cost_report": _cost_report_hook(cfg),
             "path": None,
             "sub_queries": sub_queries,
+            "curation": curation,
         }
     raw_chars = sum(len(p["raw_content"]) for p in pages)
     #用[原问题+子问题]当检索词，子问题是模型按检索需要生成的
@@ -432,6 +448,7 @@ def full_research(query: str, *, cfg: Config | None = None) -> dict[str, Any]:
             "cost_report": _cost_report_hook(cfg),
             "path": None,
             "sub_queries": sub_queries,
+            "curation": curation,
         }
     sources = parse_context_sources(context)
     report = write_report(query,context,sources, cfg=cfg)
@@ -443,4 +460,5 @@ def full_research(query: str, *, cfg: Config | None = None) -> dict[str, Any]:
         "cost_report": _cost_report_hook(cfg),
         "path": str(path),
         "sub_queries": sub_queries,
+        "curation": curation,
     }

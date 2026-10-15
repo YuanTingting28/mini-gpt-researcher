@@ -268,7 +268,7 @@ def cmd_research(args: argparse.Namespace) -> int:
     """阶段 8：一键跑完核心链路并落盘。"""
     from pipeline import full_research
 
-    result = full_research(args.query, cfg=load_config())
+    result = full_research(args.query, cfg=load_config(),curate=args.curate)
     for i, sub in enumerate(result.get("sub_queries", []), 1):
         print(f"  {i}. {sub}")
     print(f"报告已写入: {result['path']}")
@@ -308,7 +308,36 @@ def cmd_agents(args:argparse.Namespace) -> int:
         print("\n" + "-" * 60)
         print(result["cost_report"])
     return 0
+def cmd_curate(args: argparse.Namespace) -> int:
+    """阶段 13：抓取 -> 来源管家筛选排序（对照上游 skills/curator.py）。"""
+    from curator import curate_pages
+    from pipeline import _collect_pages, _cost_report_hook, plan_research
 
+    cfg = load_config()
+    subs = plan_research(args.query, cfg=cfg)
+    for i, sub in enumerate(subs, 1):
+        print(f"  {i}. {sub}")
+    pages = _collect_pages(subs, cfg=cfg)
+    if not pages:
+        print("一个页面都没抓到，没有可筛的来源")
+        return 1
+    result = curate_pages(args.query, pages, cfg=cfg)
+    print(f"抓取 {len(pages)} 篇 -> 保留 {len(result['pages'])} 篇")
+    if not result["ok"]:
+        print(f"（管家没筛成，已原样放行：{result['reason']}）")
+    elif result["reason"]:
+        print(f"（{result['reason']}）")
+    print("-" * 60)
+    for item in result["kept"]:
+        why = f"  —— {item['why']}" if item["why"] else ""
+        print(f"  留 [{item['n']}] {item['title'][:48]}{why}")
+    for item in result["dropped"]:
+        why = f"  —— {item['why']}" if item["why"] else ""
+        print(f"  丢 [{item['n']}] {item['title'][:48]}{why}")
+    if args.costs:
+        print("\n" + "-" * 60)
+        print(_cost_report_hook(cfg))
+    return 0
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="mini-gpt-researcher")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -345,8 +374,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("research", help="阶段 8：完整链路")
     p.add_argument("query")
+    p.add_argument(
+        "--curate",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="阶段 13：抓完先让来源管家筛一遍（不指定就跟随 .env 的 CURATE_SOURCES）",
+    )
     p.set_defaults(func=cmd_research)
-
+    p = sub.add_parser("curate", help="阶段 13：来源管家筛选排序")
+    p.add_argument("query")
+    p.add_argument("--costs", action="store_true", help="打印这一步的成本")
+    p.set_defaults(func=cmd_curate)
     p = sub.add_parser("agents", help="阶段 9：多 Agent 编辑部")
     p.add_argument("query")
     p.add_argument("--rounds", type=int, default=3, help="最多评审几轮")
@@ -366,7 +404,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 STAGE_OF = {
     "search": 1, "summary": 2, "plan": 3, "fetch": 4,
-    "context": 5, "report": 6, "research": 8,"agents":9
+    "context": 5, "report": 6, "research": 8,"agents":9,
+    "curate": 13
 }
 
 def main() -> int:

@@ -53,7 +53,16 @@ def _env_float(key: str, default: float) -> float:
         return float(raw)
     except ValueError:
         raise ValueError(f"环境变量 {key} 应该是小数，实际是 {raw!r}") from None
+def _env_bool(key: str, default: bool) -> bool:
+    """env 里布尔值只能写成字符串，这里统一认 1/true/yes/on（不分大小写）。
 
+    只把空串当成"没设"：设了 CURATE_SOURCES=0 就该是 False，
+    不能因为 "0" 是真值字符串就变成 True —— 那是典型的环境变量坑。
+    """
+    raw = os.getenv(key)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
 
 def parse_llm(model: str) -> tuple[str, str]:
     """``"deepseek:deepseek-chat"`` -> ``("deepseek", "deepseek-chat")``。
@@ -103,7 +112,14 @@ class Config:
     max_concurrency:int = _env_int("MAX_CONCURRENCY", 4)
     #一轮研究最多抓取多少页面？ 4个子问题 * 6 条结果 = 24个URL
     max_pages:int = _env_int("MAX_PAGES", 12)
-
+    # ---- 来源管家（阶段13）----
+    #: 是否在压缩之前先让来源管家筛一遍。默认关：它要多一次模型调用。
+    #: 对照上游 default.py:18 "CURATE_SOURCES": False（默认也是关）。
+    curate_sources: bool = _env_bool("CURATE_SOURCES", False)
+    #: 最多保留几篇来源。抓 12 篇、筛掉一半，是常见的量级。
+    curate_max_results: int = _env_int("CURATE_MAX_RESULTS", 10)
+    #: 目录里每篇给模型看的开头长度（字符）。
+    curate_snippet_chars: int = _env_int("CURATE_SNIPPET_CHARS", 600)
     context_filter: str = _env_str("CONTEXT_FILTER", "keyword")
     compression_threshold: int = _env_int("COMPRESSION_THRESHOLD", 8000)
     keyword_relative_threshold: float = _env_float("KEYWORD_RELATIVE_THRESHOLD", 0.5)
