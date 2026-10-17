@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 import llm
+from agent_creator import writing_persona
 from config import Config, load_config
 from llm import chat
 from prompts import (report_conclusion_prompt, report_introduction_prompt,
@@ -170,7 +171,7 @@ def _insert_introduction(body: str, intro: str) -> str:
 # ------------------------------------------------------------------ 生成
 
 
-def build_report_prompt(query: str, context: str, *, cfg: Config,extra:str="") -> str:
+def build_report_prompt(query: str, context: str, *, cfg: Config,extra:str="",persona:str="") -> str:
     """拼报告提示词。
 
     对照源码：gpt_researcher/prompts.py:262
@@ -187,6 +188,7 @@ def build_report_prompt(query: str, context: str, *, cfg: Config,extra:str="") -
         total_words=cfg.total_words,
         max_source=max((s["n"] for s in sources),default=0),
         extra=extra,
+        persona=persona,
     )
 
 
@@ -324,6 +326,7 @@ def write_body(
         cfg: Config | None = None,
         extra_instructions:str="",
         drop_conclusion: bool = True,
+        expert:Any=None,
 ) ->str:
     """只写正文 不含引言/结论/文献
 
@@ -334,7 +337,14 @@ def write_body(
     行为与拆分前完全一致）
     """
     cfg = cfg or load_config()
-    body = _generate(build_report_prompt(query, context, cfg=cfg,extra=extra_instructions),cfg,step="正文",temperature=BODY_TEMPERATURE)
+    body = _generate(build_report_prompt(query,
+                                         context,
+                                         cfg=cfg,
+                                         extra=extra_instructions,
+                                         persona=writing_persona(expert))
+                     ,cfg
+                     ,step="正文"
+                     ,temperature=BODY_TEMPERATURE)
     return _clean_report(body,drop_conclusion=drop_conclusion)
 
 def add_side_sections(

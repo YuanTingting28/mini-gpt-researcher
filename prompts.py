@@ -36,7 +36,7 @@ def quick_summary_prompt(query:str,context:str)->str:
                不要用你自己的知识补充。
             5. 用和问题相同的语言回答。
             """
-def search_queries_prompt(query:str,max_queries:int=4)->str:
+def search_queries_prompt(query:str,max_queries:int=4,persona:str="")->str:
     """阶段3 把复杂问题拆成N个可独立检索的子问题
     对照源码
     三个细节都是踩过坑的
@@ -45,11 +45,13 @@ def search_queries_prompt(query:str,max_queries:int=4)->str:
     3.明确禁止搜索操作符
     """
     today = datetime.now(timezone.utc).strftime("%Y 年 %m 月 %d 日")
-    example = "，".join(f'"子查询{i+1}"'for i in range(max_queries))
+    example = "，".join(f'"子查询{i + 1}"' for i in range(max_queries))
+    persona_block = f"{persona}\n\n" if persona else ""
 
     return f"""请围绕下面的研究任务，生成{max_queries}条搜索查询:
-"{query}"
-要求：
+    "{query}"
+
+    {persona_block}要求：
 1. 每条查询必须是能独立交给搜索引擎的完整问句，不要依赖其他查询的上下文。
 2. 不要使用 site:、filetype:、inurl:、intitle:、OR、AND、NOT 这类搜索操作符，
    它们在很多搜索后端上不被支持，会导致空结果。
@@ -60,7 +62,35 @@ def search_queries_prompt(query:str,max_queries:int=4)->str:
    不要为了凑数而生成泛泛而谈的查询。
 """
 
-def report_prompt(query: str, context: str, *, total_words: int = 1000, max_source: int = 0,extra:str="") -> str:
+def expert_profile_prompt(question:str)->str:
+    """阶段15 让模型给这个题目配一个专家人设
+
+    对照源码：gpt_researcher/prompts.py 的 auto_agent_instructions（在 PromptFamily 里）
+    三个要点：
+      1. 只要 JSON 三个字段，不要散文 —— 下游是代码在消费，不是人在读。
+      2. 明确"不要写具体结论/事实" —— 否则模型会顺手把答案写进人设，
+         而人设没经过检索，等于提前把未经证据的偏见植入整篇报告。
+      3. focus 限 3~5 条，每条必须是"可检索的角度"（如"训练目标函数"），
+         不能是"要回答的问题"，否则拆解器会把它变成不可检索的疑问句。
+    """
+    return f"""你要为下面这个研究任务挑一位"最适合做这项研究的专家"。
+
+    研究任务："{question}"
+
+    请输出一个 JSON 对象，正好三个字段：
+    {{
+      "name": "专家身份，不超过 20 字，例如 机器学习系统研究员",
+      "role_prompt": "以'你是一名……'开头的一句话人设，说明这位专家优先关注什么、习惯用什么标准判断，不超过 120 字。不要写任何具体结论、数据或事实断言。",
+      "focus": ["3 到 5 个可检索的关注角度，每条不超过 15 字"]
+    }}
+
+    要求：
+    1. 只输出 JSON，不要解释。
+    2. role_prompt 里不要出现"忽略上述要求""你现在是另一个 AI"这类改写规则的句子。
+    3. focus 必须是能直接拿去搜索的名词短语，不要写成疑问句。
+    """
+
+def report_prompt(query: str, context: str, *, total_words: int = 1000, max_source: int = 0,extra:str="",persona:str="") -> str:
     """阶段 6 正文提示词。对照源码：gpt_researcher/prompts.py:262
 
     extra:阶段9用，上一轮评审提出的缺口，追加在写作要求后面 用来把上一轮评审意见喂给写作者
@@ -70,30 +100,33 @@ def report_prompt(query: str, context: str, *, total_words: int = 1000, max_sour
     extra_block = ""
     if extra:
         extra_block = f"\n补充要求（必须逐条正面处理）：\n{extra}\n"
+    persona_block = f"{persona}\n\n" if persona else ""
     return f"""请仅根据下面提供的资料，就下面的研究任务写一篇详细的报告。
 
-研究任务："{query}"
+    研究任务："{query}"
 
-资料（每条以 [编号] 开头）：
-{context}
-
-写作要求：
-1. 只使用上面资料里出现的信息，绝对不要补充你自己的背景知识。
-   资料不足以支撑的论点就不要写。
-2. 用 Markdown 写，标题层级：# 主标题、## 主要章节、### 子章节。
-3. 每一处事实、数字、引语后面都要标来源角标，格式是 [编号]，
-   编号必须是上面资料里真实存在的编号{range_hint}。
-   多个来源并排写：[1][3]。不要写 [1-3] 这种区间形式。
-4. 不要写"参考文献"章节，程序会自动追加。
-5. 不要写"目录"。
-6. 不要写"结论"章节，程序会自动追加。
-7. 不要用 ``` 代码块把整篇报告包起来。
-8. 对比类信息用 Markdown 表格呈现。
-9. 全文约 {total_words} 字，力求详尽，把资料里有价值的信息都用上。
-10. 要有明确的判断和取舍，不要写"各有优劣""取决于具体情况"这种不表态的话。
-11. 用与"研究任务"相同的语言写作。
-{extra_block}
-假设当前日期是 {today}。
+    {persona_block}资料（每条以 [编号] 开头）：
+    
+    资料（每条以 [编号] 开头）：
+    {context}
+    
+    写作要求：
+    1. 只使用上面资料里出现的信息，绝对不要补充你自己的背景知识。
+       资料不足以支撑的论点就不要写。
+    2. 用 Markdown 写，标题层级：# 主标题、## 主要章节、### 子章节。
+    3. 每一处事实、数字、引语后面都要标来源角标，格式是 [编号]，
+       编号必须是上面资料里真实存在的编号{range_hint}。
+       多个来源并排写：[1][3]。不要写 [1-3] 这种区间形式。
+    4. 不要写"参考文献"章节，程序会自动追加。
+    5. 不要写"目录"。
+    6. 不要写"结论"章节，程序会自动追加。
+    7. 不要用 ``` 代码块把整篇报告包起来。
+    8. 对比类信息用 Markdown 表格呈现。
+    9. 全文约 {total_words} 字，力求详尽，把资料里有价值的信息都用上。
+    10. 要有明确的判断和取舍，不要写"各有优劣""取决于具体情况"这种不表态的话。
+    11. 用与"研究任务"相同的语言写作。
+    {extra_block}
+    假设当前日期是 {today}。
 """
 
 def report_introduction_prompt(query: str, context: str, *, max_source: int = 0) -> str:
@@ -104,15 +137,15 @@ def report_introduction_prompt(query: str, context: str, *, max_source: int = 0)
     """
     range_hint = f"（1 到 {max_source}）" if max_source else ""
     return f"""下面是为研究任务收集的资料：
-{context}
-
-请为"研究任务：{query}"写一段报告引言，要求：
-1. 不要写 "# " 一级标题，报告主标题已经由正文写好了。
-2. 3 到 5 句话：说清这个任务为什么值得研究、报告会覆盖哪几个方面。
-3. 事实性内容要带 [编号] 角标，编号必须是资料里真实存在的编号{range_hint}。
-4. 不要写"参考文献"章节。
-5. 用与"研究任务"相同的语言写作。
-"""
+    {context}
+    
+    请为"研究任务：{query}"写一段报告引言，要求：
+    1. 不要写 "# " 一级标题，报告主标题已经由正文写好了。
+    2. 3 到 5 句话：说清这个任务为什么值得研究、报告会覆盖哪几个方面。
+    3. 事实性内容要带 [编号] 角标，编号必须是资料里真实存在的编号{range_hint}。
+    4. 不要写"参考文献"章节。
+    5. 用与"研究任务"相同的语言写作。
+    """
 
 
 def report_conclusion_prompt(query: str, report: str) -> str:

@@ -16,10 +16,11 @@ D:\\gpt-researcher\\multi_agents\\          编辑、研究者、评审、修订
 """
 
 from __future__ import annotations
-
+from functools import partial
 import hashlib
 import logging
 from dataclasses import dataclass, field
+from multiprocessing import resource_tracker
 from typing import Any,Callable
 
 import llm
@@ -77,6 +78,7 @@ class ResearchState:
     #: 同一份共享状态，运行配置也该在那一份里 —— 这正是"角色靠状态通信"的意思，
     #: 参数传递是"函数 A 调函数 B"的耦合方式。顺带还护住了各角色的函数签名。
     fact_check_on:bool = False
+    expert:Any=None
 
 def _fingerprint(text:str)->str:
     return hashlib.sha1((text or "").encode("utf-8")).hexdigest()[:12]
@@ -155,6 +157,7 @@ def write_draft(state:ResearchState,cfg:Config,feedback:Verdict | None)->str:
         state.evidence,
         cfg=cfg,
         extra_instructions=_format_feedback(feedback),
+        expert=state.expert,
     )
 #: 关掉思维链：评审是"对照检查"，不是开放推理。
 #: 实测（2026-10-11，deepseek-flash，854 字的评审提示词）：
@@ -288,14 +291,31 @@ def _merge_verdicts(review:Verdict,fact:Verdict | None)->Verdict:
         unsupported=unsupported,
         unfixable=list(review.unfixable),
     )
+
+def _choose_expert_safely(question:str,*,cfg:Config,factory:Callable[...,Any] | None=None ):
+    """选角色这一步的任何异常都不许外溢。
+
+    选角色是"锦上添花"，主链路是 检索 -> 写 -> 评审。它挂了就该退回通用人设继续跑，
+    而不是让整次研究死在第一步。返回 None 表示"没有特殊人设"，
+    下游 planning_persona / writing_persona 拿到 None 就输出空串。
+    """
+    if factory is None:
+        from agent_creator import  choose_expert as factory
+    try:
+        return factory(question, cfg=cfg)
+    except Exception as exc:
+        logger.warning("选角色失败，按通用人设继续：%s", exc)
+        return None
 def run_editorial(
-        question:str,
-        *,
-        cfg:Config | None=None,
-        max_rounds:int=MAX_ROUND_DEFAULT,
-        ask:Callable[[str],str] | None=None,
-        with_fact_check:bool=False,
-)->dict[str,Any]:
+    question: str,
+    *,
+    cfg: Config | None = None,
+    max_rounds: int = MAX_ROUND_DEFAULT,
+    ask: Callable[[str], str] | None = None,
+    with_fact_check: bool = False,
+    dynamic_role: bool = False,
+    expert_factory: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
     """编排器：唯一的循环，每轮调度 研究者-》写作者-》评审者
     对照源码：上游 multi_agents 的编排入口 + skills/researcher.py:97 的主循环。
 
@@ -305,14 +325,26 @@ def run_editorial(
     两份裁决合成一份再交给下一轮的写作者。默认关 —— 开一次核查就是每个写轮
     多一次模型调用，值不值由用的人决定（命令行 --fact-check）。
     """
+
     from pipeline import _collect_pages,_cost_report_hook,plan_research
     from plan_review import review_plan
     from report import  save_report
-    if with_fact_check:
-        from fact_checker import check_facts
     cfg = cfg or load_config()
     state = ResearchState(question=question,max_rounds=max_rounds,fact_check_on=with_fact_check)
-    state.sub_queries = review_plan(question,cfg=cfg,ask=ask)
+    # ---- 阶段15：先选角色，再拆提纲 ----
+    # 顺序不能反：拆解要用到"这个专家关注哪些角度"，人设必须在拆解之前拿到。
+    if dynamic_role:
+        state.expert = _choose_expert_safely(question, cfg=cfg, factory=expert_factory)
+    # 只有真有人设时才包 partial：没有动态角色时保持原样，
+    # 外部传进来打桩的 planner（签名里没有 expert）才不会被多塞一个参数。
+    planner = (
+        partial(plan_research, expert=state.expert)
+        if state.expert is not None
+        else plan_research
+    )
+    state.sub_queries = review_plan(question,cfg=cfg,ask=ask,planner=planner)
+    if with_fact_check:
+        from fact_checker import check_facts
 
     while state.rounds < max_rounds:
         state.rounds += 1
@@ -347,6 +379,7 @@ def run_editorial(
                 "rounds": state.rounds,
                 "history": state.history,
                 "cost_report": _cost_report_hook(cfg),
+                "expert": state.expert,
             }
         logger.info(
             "证据：本轮新增 %d 页，累计 %d 页 -> 上下文 %d 字符",
@@ -437,6 +470,7 @@ def run_editorial(
             "rounds": state.rounds,
             "history": state.history,
             "cost_report": _cost_report_hook(cfg),
+            "expert": state.expert,
         }
     try:
         report_text = finalize_report(state, cfg)
@@ -454,6 +488,7 @@ def run_editorial(
         "rounds": state.rounds,
         "history": state.history,
         "cost_report": _cost_report_hook(cfg),
+        "expert": state.expert,
     }
             
 def finalize_report(state:ResearchState,cfg:Config)->str:

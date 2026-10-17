@@ -279,6 +279,8 @@ def cmd_agents(args:argparse.Namespace) -> int:
     """阶段9：多Agent编辑部 / 阶段10：可选的人审提纲 / 阶段11：可选的事实核查"""
     from agents import run_editorial
     ask = input if args.human else None
+    if args.dynamic_role:
+        print("（已开动态角色：先按题目挑专家人设，再拆提纲和写作）")
     if ask is None:
         print("（未开人审：加 --human 可以在拆完提纲后先看一遍再开始跑）")
     if args.fact_check:
@@ -289,7 +291,11 @@ def cmd_agents(args:argparse.Namespace) -> int:
         max_rounds=args.rounds,
         ask=ask,
         with_fact_check=args.fact_check,
+        dynamic_role=args.dynamic_role,
     )
+    expert = result.get("expert")
+    if expert is not None:
+        print(f"\n专家人设：{expert.name} —— {expert.role_prompt}\n")
     print(result["report"])
     for h in result.get("history", []):
         verdict = h.get("verdict") or {}
@@ -397,6 +403,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--fact-check",
         action="store_true",
         help="阶段 11：每轮写完后让事实核查员逐句核对引用有没有依据（每轮多一次模型调用）",
+    )
+    p.add_argument(
+        "--dynamic-role",
+        action="store_true",
+        help="阶段 15：先让模型按题目选一位专家人设，再拆提纲和写作",
     )
     p.set_defaults(func=cmd_agents)
     return parser

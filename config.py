@@ -13,10 +13,11 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, fields
-
+from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+_ENV_PATH = Path(__file__).resolve().parent / ".env"
+load_dotenv(_ENV_PATH)
 
 #: provider -> 从哪里取 key，以及默认 base_url
 PROVIDERS: dict[str, dict[str, str]] = {

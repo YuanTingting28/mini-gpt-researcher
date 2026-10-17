@@ -155,7 +155,7 @@ def quick_summary(query: str, *, cfg: Config | None = None) -> str:
     return chat([{"role":"user","content":prompt}],cfg=cfg,step="摘要")
 
 
-def plan_research(query: str, *, cfg: Config | None = None) -> list[str]:
+def plan_research(query: str, *, cfg: Config | None = None,expert:Any=None) -> list[str]:
     """阶段 3：复杂问题 -> 子问题列表。
 
     对照源码：gpt_researcher/actions/query_processing.py:83 generate_sub_queries
@@ -171,7 +171,9 @@ def plan_research(query: str, *, cfg: Config | None = None) -> list[str]:
       4. 全都解析不出来 -> 退化成 [query]，绝不能返回空列表
     """
     cfg = cfg or load_config()
-    prompt = search_queries_prompt(query,cfg.max_sub_queries)
+    from agent_creator import planning_persona
+
+    prompt = search_queries_prompt(query,cfg.max_sub_queries,persona=planning_persona(expert))
     response = chat([{"role":"user","content":prompt}],cfg=cfg,step="子问题")
     parsed = parse_json(response)
     if parsed is None:
