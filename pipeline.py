@@ -320,7 +320,7 @@ def _collect_pages(sub_queries:list[str],cfg:Config)->list[dict[str, Any]]:
     workers = max(1,min(cfg.max_concurrency,len(urls)))
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
-            pool.submit(_fetch_one,url,titles.get("url",""),cfg):url for url in urls
+            pool.submit(_fetch_one,url,titles.get(url,""),cfg):url for url in urls
         }
         for fut in as_completed(futures):
             url = futures[fut]

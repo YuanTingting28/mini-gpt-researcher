@@ -268,12 +268,17 @@ def cmd_research(args: argparse.Namespace) -> int:
     """阶段 8：一键跑完核心链路并落盘。"""
     from pipeline import full_research
 
-    result = full_research(args.query, cfg=load_config(),curate=args.curate)
-    for i, sub in enumerate(result.get("sub_queries", []), 1):
-        print(f"  {i}. {sub}")
-    print(f"报告已写入: {result['path']}")
-    print(result["cost_report"])
-    return 0
+    cfg = load_config()
+    if args.facade:
+        # 阶段 16：同一条链路的另一条实现 —— 门面 + 技能
+        from researcher import Researcher
+
+        on_event = (lambda e, p: print(f"  [{e}] {p}")) if args.events else None
+        result = Researcher(cfg=cfg, on_event=on_event).run(
+            args.query, curate=args.curate
+        )
+    else:
+        result = full_research(args.query, cfg=cfg, curate=args.curate)
 
 def cmd_agents(args:argparse.Namespace) -> int:
     """阶段9：多Agent编辑部 / 阶段10：可选的人审提纲 / 阶段11：可选的事实核查"""
@@ -385,6 +390,16 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="阶段 13：抓完先让来源管家筛一遍（不指定就跟随 .env 的 CURATE_SOURCES）",
+    )
+    p.add_argument(
+        "--facade",
+        action="store_true",
+        help="阶段 16：走技能层门面 Researcher 的编排（与旧链路等价）",
+    )
+    p.add_argument(
+        "--events",
+        action="store_true",
+        help="阶段 16：打印编排事件流（配合 --facade）",
     )
     p.set_defaults(func=cmd_research)
     p = sub.add_parser("curate", help="阶段 13：来源管家筛选排序")

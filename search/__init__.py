@@ -3,14 +3,20 @@
 from __future__ import annotations
 
 from .base import BaseRetriever
-
+from .arxiv import ArxivRetriever
+from .duckduckgo import DuckDuckGoRetriever
+from .tavily import TavilyRetriever
 RETRIEVERS: dict[str, type[BaseRetriever]] = {}
+
+
 
 
 def register(name: str, cls: type[BaseRetriever]) -> None:
     RETRIEVERS[name.lower()] = cls
 
-
+register("arxiv", ArxivRetriever)
+register("duckduckgo", DuckDuckGoRetriever)
+register("tavily", TavilyRetriever)
 def get_retriever(name: str, query: str, query_domains: list[str] | None = None) -> BaseRetriever:
     """按名字造一个检索器实例。
 
