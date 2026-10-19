@@ -65,6 +65,20 @@ def _env_bool(key: str, default: bool) -> bool:
         return default
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
+def _env_list(key: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    """逗号（或分号）分隔的列表。空值一律回退到默认值，不留空元组。"""
+    raw = os.environ.get(key, "").strip()
+    if not raw:
+        return default
+    items = [part.strip().lower() for part in raw.replace(";", ",").split(",")]
+    out = [part for part in items if part]
+    return tuple(dict.fromkeys(out)) or default
+
+
+def _default_retrievers() -> tuple[str, ...]:
+    """阶段17：RETRIEVERS 没配就退回单源 RETRIEVER —— 老 .env 一个字都不用改。"""
+    return _env_list("RETRIEVERS", (_env_str("RETRIEVER", "tavily"),))
+
 def parse_llm(model: str) -> tuple[str, str]:
     """``"deepseek:deepseek-chat"`` -> ``("deepseek", "deepseek-chat")``。
 
@@ -104,6 +118,8 @@ class Config:
     smart_token_limit: int = _env_int("SMART_TOKEN_LIMIT", 4000)
 
     retriever: str = _env_str("RETRIEVER", "tavily")
+    #阶段17，按顺序参与检索的源，合并时按这个顺序排，保证引用编号可复现
+    retrievers:tuple[str,...] = _default_retrievers()
     max_search_results: int = _env_int("MAX_SEARCH_RESULTS", 6)
     max_sub_queries: int = _env_int("MAX_SUB_QUERIES", 4)
 
@@ -136,7 +152,13 @@ class Config:
     #: 单个响应体的字节上限（阶段 12）。PDF 十几 MB 很常见，而 Content-Length
     #: 是服务器说了算的 —— 读取时按这个上限叫停（见 scrape._read_body）。
     scrape_max_bytes: int = _env_int("SCRAPE_MAX_BYTES", 30 * 1024 * 1024)
-    
+    #相关英文文献的分析
+    paper_wiki: bool = _env_bool("PAPER_WIKI", True)
+    paper_wiki_max: int = _env_int("PAPER_WIKI_MAX", 3)
+    paper_wiki_chars: int = _env_int("PAPER_WIKI_CHARS", 12000)
+    paper_wiki_excerpt_chars: int = _env_int("PAPER_WIKI_EXCERPT_CHARS", 4000)
+    paper_wiki_max_tokens: int = _env_int("PAPER_WIKI_MAX_TOKENS", 1800)
+    paper_wiki_concurrency: int = _env_int("PAPER_WIKI_CONCURRENCY", 2)
     # 检索器的 HTTP 超时
     request_timeout: int = _env_int("REQUEST_TIMEOUT", 15)
     def show(self) -> str:

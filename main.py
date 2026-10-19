@@ -188,14 +188,17 @@ def cmd_check(args: argparse.Namespace) -> int:
 
 
 def cmd_search(args: argparse.Namespace) -> int:
-    """阶段 1：搜索 -> 打印结构化结果。"""
-    from search import get_retriever
+    """阶段 1/17：搜索 -> 打印结构化结果(多源并发)。"""
+    from pipeline import search_many
+    cfg = load_config()
+    names = cfg.retrievers or (cfg.retriever,)
+    results = search_many(args.query,cfg,max_result=args.max)
 
-    retriever = get_retriever(load_config().retriever, args.query)
-    results = retriever.search(max_results=args.max)
     if not results:
-        print("没有结果（检查网络或检索器配置）")
+        print(f"没有结果（检索源：{'/'.join(names)}；检查网络、API key 或换个查询）")
         return 1
+
+    print(f"检索源：{' -> '.join(names)}（并发检索，按此顺序合并去重）")
     for i, item in enumerate(results, 1):
         print(f"\n[{i}] {item.get('title') or '(无标题)'}")
         print(f"    {item.get('href') or item.get('url')}")

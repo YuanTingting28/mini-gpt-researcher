@@ -19,9 +19,10 @@
 """
 
 from __future__ import annotations
-
+import dataclasses
 import logging
 import re
+from concurrent import futures
 from typing import Any
 from llm import chat
 from prompts import quick_summary_prompt,search_queries_prompt
@@ -143,8 +144,7 @@ def quick_summary(query: str, *, cfg: Config | None = None) -> str:
     """
     cfg = cfg or load_config()
     #1.检索
-    retriever = get_retriever(cfg.retriever,query)
-    results = retriever.search(cfg.max_search_results)
+    results = search_many(query,cfg)
     if not results:
         # 阶段8会一次跑很多子查询，这里不能抛异常
         return "检索没有返回任何结果，无法生成摘要。"
@@ -196,34 +196,18 @@ def build_context(query: str, *, cfg: Config | None = None) -> dict[str, Any]:
     并发抓取放到阶段 8 再做，这里先串行。
     """
     from context import select_context
-    from scrape import fetch
     cfg = cfg or load_config()
-    retriever = get_retriever(cfg.retriever,query)
-    results = retriever.search(cfg.max_search_results)
-    pages:list[dict[str, Any]] = []
-    for item in results:
-        url  = item.get("url") or item.get("href")
-        if not url:
-            continue
-        page = fetch(url,cfg=cfg)
-        if not page["ok"]:
-            # 单页失败只跳过，不中断整轮 —— 其他页面还能提供价值
-            logger.info("抓取失败，跳过 %s（%s）", url, page["reason"])
-            continue
-        pages.append(
-            {
-                "title": page["title"] or item.get("title") or "",
-                "url": page["url"],
-                "raw_content": page["raw_content"],
-            }
-        )
+    pages = _collect_pages([query],cfg=cfg)
     if not pages:
         logger.warning("全部抓取失败，没有可用上下文")
         return {"context": "", "sources": [], "raw_chars": 0}
     raw_chars = sum(len(p["raw_content"]) for p in pages)
     context = select_context(query,pages,cfg=cfg)
     logger.info(
-        "抓取 %d 页 / %d 字符 -> 上下文 %d 字符", len(pages), raw_chars, len(context)
+        "抓取 %d 页 / %d 字符 -> 上下文 %d 字符",
+        len(pages),
+        raw_chars,
+        len(context),
     )
     return {"context": context, "sources": pages, "raw_chars": raw_chars}
 
@@ -254,11 +238,78 @@ def reset_dead_urls()->None:
     """清空负缓存。长驻进程里如果想「过一段时间再试一次」，调这个。"""
     _DEAD_URLS.clear()
 
+def _retriever_names(cfg:Config) ->tuple[str,...]:
+    """这次用哪些检索源。兼容没有retrievers字段的假cfg（自检里到处是）"""
+    names = getattr(cfg,"retrievers",None) or (cfg.retriever,)
+    return tuple(n for n in names if n) or (cfg.retriever,)
+
+def _search_with(name:str,sub_query:str,cfg:Config) -> list[dict[str,Any]]:
+    """单个检索源头。单独抽出来是为了多源时能被线程池调度、也方便打桩。"""
+    return get_retriever(name,sub_query).search(cfg.max_search_results)
+
+def _search_many(sub_query:str,names:tuple[str,...],cfg:Config)->list[dict[str,Any]]:
+    """
+    多源并发检索 -》 按配置顺序合并去重 （保证确定性）
+    顺序为什么必须是names的顺序而不是完成顺序；
+    检索先完成的是“快的源”，不是“该排前面的源”。而[1]..[n]的编号是引用
+    体系的根，一旦顺序随机，同一批查询两次跑出来引用编号就对不上。
+    报告也就不可复现。并发只发生在取数据这一步，合并必须确定性。
+    """
+    hits:dict[str,list[dict[str,Any]]] = {}
+    with ThreadPoolExecutor(max_workers=max(1,len(names))) as  pool:
+        futures = {pool.submit(_search_with,name,sub_query,cfg):name for name in names}
+        for fut in as_completed(futures):
+            name = futures[fut]
+            try:
+                hits[name] = fut.result() or []
+            except Exception as exc:
+                logger.warning("检索源 %s 失败，跳过（其他源继续）：%s", name, exc)
+    merged:list[dict[str,Any]] = []
+    seen:set[str] = set()
+    for name in names:
+        for item in hits.get(name,[]):
+            url = str(item.get("href") or item.get("url") or "").strip()
+            key = _normalize_url(url)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            merged.append(item)
+    logger.info(
+        "子问题「%s」：%s -> 合并 %d 条",
+        (sub_query or "")[:40],
+        "/".join(names),
+        len(merged),
+    )
+    return merged
 
 def _search_one(sub_query:str,cfg:Config)->list[dict[str, Any]]:
-    """但各子问题检索，抛异常由调用方决定怎么处理"""
-    retriever = get_retriever(cfg.retriever,sub_query)
-    return retriever.search(cfg.max_search_results)
+    """单个子问题的检索。抛异常由调用方决定怎么处理。
+
+    阶段17：配了多个源就并发跑再合并；只有一个源时走老路径，
+    不额外起线程池，行为和阶段8 完全一致。
+    """
+    names = _retriever_names(cfg)
+    if len(names) == 1:
+        return _search_with(names[0], sub_query, cfg)
+    return _search_many(sub_query, names, cfg)
+
+"""
+用 ThreadPoolExecutor 并发跑每个源；
+某个源抛异常只跳过它自己；
+合并时按 cfg.retrievers 的顺序，不按完成顺序，保证 [1]..[n] 引用编号可复现；
+用 _normalize_url 跨源去重。
+"""
+
+def search_many(sub_query:str,cfg:Config,*,max_result:int | None = None) -> list[dict[str,Any]]:
+    """公开入口：按cfg.retrievers 多源并发检索 按配置顺序合并去重
+    max_results 只影响这一次调用 不修改传进来的 cfg
+    """
+    if max_result is not None:
+        cfg = dataclasses.replace(cfg,max_search_results=max_result)
+    names = _retriever_names(cfg)
+    if len(names) == 1:
+        return _search_with(names[0],sub_query, cfg)
+    return _search_many(sub_query,names,cfg)
 
 def _fetch_one(url:str,search_title:str,cfg:Config)->dict[str,Any] | None:
     from scrape import fetch
@@ -440,6 +491,9 @@ def full_research(query: str, *, cfg: Config | None = None,
     raw_chars = sum(len(p["raw_content"]) for p in pages)
     #用[原问题+子问题]当检索词，子问题是模型按检索需要生成的
     filter_query = " ".join([query,*sub_queries])
+    #分析论文z
+    from paper_wiki import enrich_papers
+    pages = enrich_papers(pages, cfg=cfg)
     context = select_context(filter_query,pages,cfg=cfg)
     logger.info("抓取 %d 页 / %d 字符 -> 上下文 %d 字符", len(pages), raw_chars, len(context))
     if not context.strip():

@@ -365,6 +365,8 @@ def run_editorial(
                 logger.warning("研究者这一轮失败，用已有证据继续：%s", exc)
                 pages = []
             if pages:
+                from paper_wiki import enrich_papers
+                pages = enrich_papers(pages, cfg=cfg)
                 state.pages = _merge_pages(state.pages, pages)
             for gap in targets:  # 计一次尝试
                 state.gap_tries[gap] = state.gap_tries.get(gap, 0) + 1
