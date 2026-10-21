@@ -206,6 +206,81 @@ def cmd_search(args: argparse.Namespace) -> int:
         print(f"    {body[:160]}")
     return 0
 
+def cmd_local_index(args: argparse.Namespace) -> int:
+    """阶段 19：建立/增量更新本地文档索引。"""
+    from document.index import index_paths
+
+    cfg = load_config()
+    paths = list(args.paths or cfg.document_paths)
+
+    if not paths:
+        print("没有文档路径。")
+        print("用法：python main.py local-index D:\\papers")
+        print("或在 .env 里设置 DOCUMENT_PATHS=D:\\papers;D:\\docs")
+        return 2
+
+    stats = index_paths(
+        paths,
+        cfg=cfg,
+        force=args.force,
+        prune=args.prune,
+        index_path=args.index,
+    )
+
+    print(f"索引文件：{stats['index_path']}")
+    print(
+        f"扫描 {stats['scanned']} 个文件：新增 {stats['added']}，"
+        f"更新 {stats['updated']}，跳过 {stats['skipped']}，失败 {stats['failed']}"
+    )
+    print(
+        f"索引现有 {stats['files']} 个文件 / {stats['pages']} 页 / "
+        f"{stats['chunks']} 个块"
+    )
+
+    for error in stats.get("errors") or []:
+        print(f"  ! {error}")
+
+    return 0 if stats["ok"] else 1
+
+def cmd_local_search(args: argparse.Namespace) -> int:
+    """阶段 19：在本地索引里检索，不联网。"""
+    from document.retriever import LocalDocumentRetriever
+
+    cfg = load_config()
+    retriever = LocalDocumentRetriever(
+        args.query,
+        cfg=cfg,
+        index_path=args.index,
+    )
+
+    results = retriever.search(max_results=args.max)
+
+    if not results:
+        print("没有检索到相关本地文档（检查索引是否存在，或换用更具体的词）")
+        return 1
+
+    for i, item in enumerate(results, 1):
+        print(f"\n[{i}] {item['title']}  score={item['score']}")
+        print(f"    {item['href']}")
+        print(f"    {item['body'][:240]}")
+
+    return 0
+
+
+def cmd_local_info(args: argparse.Namespace) -> int:
+    """阶段 19：查看索引规模。"""
+    from document.index import index_summary
+
+    info = index_summary(args.index or load_config().document_index)
+
+    print(f"索引文件：{info['path']}")
+    print(f"构建时间：{info['built_at'] or '(空索引)'}")
+    print(f"文件 {info['files']} 个 / 页 {info['pages']} / 块 {info['chunks']}")
+
+    for doc in info["documents"]:
+        print(f"  - {doc['title']}  {doc['path']}")
+
+    return 0 if info["files"] else 1
 
 def cmd_summary(args: argparse.Namespace) -> int:
     """阶段 2：搜索 + 一次 LLM 摘要。"""
@@ -365,6 +440,31 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max", type=int, default=5)
     p.set_defaults(func=cmd_search)
 
+    p = sub.add_parser("local-index", help="阶段 19：建立/更新本地文档索引")
+    p.add_argument(
+        "paths",
+        nargs="*",
+        help="PDF/TXT/MD 文件或目录；不填则用 DOCUMENT_PATHS",
+    )
+    p.add_argument("--force", action="store_true", help="扫描到的文件全部重新解析")
+    p.add_argument("--prune", action="store_true", help="清掉磁盘上已不存在的旧文件记录")
+    p.add_argument("--index", help="覆盖 DOCUMENT_INDEX 的索引路径")
+    p.set_defaults(func=cmd_local_index)
+
+    p = sub.add_parser("local-search", help="阶段 19：检索本地文档索引")
+    p.add_argument("query")
+    p.add_argument(
+        "--max",
+        type=int,
+        default=load_config().document_max_results,
+    )
+    p.add_argument("--index", help="覆盖 DOCUMENT_INDEX 的索引路径")
+    p.set_defaults(func=cmd_local_search)
+
+    p = sub.add_parser("local-info", help="阶段 19：查看本地文档索引")
+    p.add_argument("--index", help="覆盖 DOCUMENT_INDEX 的索引路径")
+    p.set_defaults(func=cmd_local_info)
+
     p = sub.add_parser("summary", help="阶段 2：搜索 + 摘要")
     p.add_argument("query")
     p.set_defaults(func=cmd_summary)
@@ -434,7 +534,9 @@ def build_parser() -> argparse.ArgumentParser:
 STAGE_OF = {
     "search": 1, "summary": 2, "plan": 3, "fetch": 4,
     "context": 5, "report": 6, "research": 8,"agents":9,
-    "curate": 13
+    "curate": 13,"local-index": 19,
+    "local-search": 19,
+    "local-info": 19,
 }
 
 def main() -> int:

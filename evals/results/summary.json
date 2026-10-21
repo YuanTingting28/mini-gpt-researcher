@@ -1,0 +1,30 @@
+[
+ {
+  "strategy": "none_capped",
+  "runs": 2,
+  "errors": 0,
+  "accuracy": null,
+  "precision": 0.1,
+  "pairwise_vs_none_capped": null,
+  "median_context_tokens": 17273.5,
+  "median_filter_seconds": 0.62,
+  "mean_write_cost": 0.032,
+  "mean_total_cost": 0.032
+ },
+ {
+  "strategy": "keyword",
+  "runs": 2,
+  "errors": 0,
+  "accuracy": null,
+  "precision": 0.399,
+  "pairwise_vs_none_capped": {
+   "win": 1,
+   "tie": 1,
+   "loss": 0
+  },
+  "median_context_tokens": 7045.0,
+  "median_filter_seconds": 0.64,
+  "mean_write_cost": 0.03419,
+  "mean_total_cost": 0.03419
+ }
+]

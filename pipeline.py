@@ -25,12 +25,21 @@ import re
 from concurrent import futures
 from typing import Any
 from llm import chat
-from prompts import quick_summary_prompt,search_queries_prompt
+from prompts import (
+    language_name,
+    query_language,
+    quick_summary_prompt,
+    rewrite_queries_language_prompt,
+    search_queries_prompt,
+)
 from concurrent.futures import ThreadPoolExecutor,as_completed
 from config import Config, load_config
 from search import get_retriever
 import json
 logger = logging.getLogger(__name__)
+
+_CJK_TEXT = re.compile(r"[\u4e00-\u9fff]")
+_ASCII_TEXT = re.compile(r"[A-Za-z]{2,}")
 
 def format_context(results:list[dict[str,Any]])->str:
     """把检索结果拼成带编号的上下文。
@@ -218,6 +227,11 @@ def _normalize_url(url:str)->str:
     去掉末尾斜杠
     保留query 因为很多站点的正文靠query区分
     """
+    raw = (url or "").strip()
+    #本地PDF 每一页共用一个文件路径，必须保留 #page=N
+    if raw.lower().startswith("file:"):
+        return raw
+
     base = (url or "").strip().split("#",1)[0]
     while base.endswith("/") and base.count("/")>2:
         base = base[:-1]
@@ -245,6 +259,11 @@ def _retriever_names(cfg:Config) ->tuple[str,...]:
 
 def _search_with(name:str,sub_query:str,cfg:Config) -> list[dict[str,Any]]:
     """单个检索源头。单独抽出来是为了多源时能被线程池调度、也方便打桩。"""
+    if name.lower() == "local":
+        from document.retriever import LocalDocumentRetriever
+        limit = max(1,int(getattr(cfg,"document_max_results",8)))
+        return LocalDocumentRetriever(sub_query,cfg=cfg).search(limit)
+
     return get_retriever(name,sub_query).search(cfg.max_search_results)
 
 def _search_many(sub_query:str,names:tuple[str,...],cfg:Config)->list[dict[str,Any]]:
@@ -328,74 +347,131 @@ def _fetch_one(url:str,search_title:str,cfg:Config)->dict[str,Any] | None:
         "raw_content": page["raw_content"],
     }
 
-def _collect_pages(sub_queries:list[str],cfg:Config)->list[dict[str, Any]]:
-    """并发检索+全局去重+并发抓取，返回[按首次出现顺序]排好的页面列表
-    单独抽出来是为了能离线测试：_search_one/_fetch_one 可以被打桩替换
-    """
-    #  --- 1.并发检索，每个子问题一次search
-    hits_by_query:dict[str,list[dict[str, Any]]] = {}
+def _collect_pages(sub_queries: list[str], cfg: Config) -> list[dict[str, Any]]:
+    """并发检索 + 全局去重 + 只对需要抓取的来源并发抓取。"""
     if not sub_queries:
         return []
-    workers = max(1,min(cfg.max_concurrency,len(sub_queries)))
+
+    hits_by_query: dict[str, list[dict[str, Any]]] = {}
+
+    workers = max(1, min(cfg.max_concurrency, len(sub_queries)))
+
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(_search_one,sub,cfg):sub for sub in sub_queries}
+        futures = {
+            pool.submit(_search_one, sub, cfg): sub
+            for sub in sub_queries
+        }
+
         for fut in as_completed(futures):
             sub = futures[fut]
             try:
                 hits_by_query[sub] = fut.result() or []
             except Exception as exc:
                 logger.warning("子问题检索失败，跳过「%s」：%s", sub, exc)
-    # ----2.全局去重 跨子问题 同一个URL只抓一次
-    urls:list[str] = []
-    titles:dict[str, str] = {}
-    seen:set[str] = set()
+
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
     for sub in sub_queries:
-        for item in hits_by_query.get(sub,[]):
-            url = (item.get("url") or item.get("href") or "").strip()
+        for item in hits_by_query.get(sub, []):
+            if not isinstance(item, dict):
+                continue
+
+            url = str(item.get("url") or item.get("href") or "").strip()
             key = _normalize_url(url)
+
             if not key or key in seen:
                 continue
-            if key in _DEAD_URLS:
-                continue  # 已知抓不出正文，别占 MAX_PAGES 的名额
-            seen.add(key)
-            urls.append(url)
-            titles[url] = item.get("title") or ""
-    if len(urls)>cfg.max_pages:
-        logger.info("去重后 %d 个 URL 超过 MAX_PAGES=%d，截断", len(urls), cfg.max_pages)
-        urls = urls[:cfg.max_pages]
-    logger.info("%d 个子问题 -> 去重后 %d 个 URL 待抓取", len(hits_by_query), len(urls))
-    if not urls:
-        return []
-    # ------3 并发抓取
-    fetched:dict[str,dict[str, Any] | None] = {}
-    workers = max(1,min(cfg.max_concurrency,len(urls)))
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {
-            pool.submit(_fetch_one,url,titles.get(url,""),cfg):url for url in urls
-        }
-        for fut in as_completed(futures):
-            url = futures[fut]
-            try:
-                fetched[url] = fut.result()
-            except Exception as exc:
-                logger.warning("抓取异常，跳过 %s：%s", url, exc)
-                fetched[url] = None
 
-    # ------4.按检索顺序回填
-    #并发完成顺序是乱的，而上下文[n]的编号是引用体系的根，必须可复现，所以这里不按完成顺序，而是urls的顺序
-    pages:list[dict[str, Any]] = []
-    seen_final:set[str] = set()
-    for url in urls:
-        page = fetched.get(url) #通过url取，也按url的顺序来
+            raw_content = str(item.get("raw_content") or "")
+
+            # 本地检索器明确声明了不需要抓取。
+            prefetched = bool(raw_content.strip()) and (
+                item.get("requires_scraping") is False
+                or url.lower().startswith("file:")
+            )
+
+            if key in _DEAD_URLS and not prefetched:
+                continue
+
+            seen.add(key)
+            candidates.append(
+                {
+                    "url": url,
+                    "title": str(item.get("title") or ""),
+                    "raw_content": raw_content if prefetched else "",
+                    "prefetched": prefetched,
+                }
+            )
+
+    max_pages = max(0, int(getattr(cfg, "max_pages", 12)))
+
+    if len(candidates) > max_pages:
+        logger.info(
+            "去重后 %d 个来源超过 MAX_PAGES=%d，截断",
+            len(candidates),
+            max_pages,
+        )
+        candidates = candidates[:max_pages]
+
+    to_fetch = [c for c in candidates if not c["prefetched"]]
+
+    logger.info(
+        "%d 个子问题 -> 去重后 %d 个来源（预取 %d，待抓取 %d）",
+        len(hits_by_query),
+        len(candidates),
+        len(candidates) - len(to_fetch),
+        len(to_fetch),
+    )
+
+    if not candidates:
+        return []
+
+    fetched: dict[str, dict[str, Any] | None] = {}
+
+    if to_fetch:
+        workers = max(1, min(cfg.max_concurrency, len(to_fetch)))
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(_fetch_one, c["url"], c["title"], cfg): c["url"]
+                for c in to_fetch
+            }
+
+            for fut in as_completed(futures):
+                url = futures[fut]
+                try:
+                    fetched[url] = fut.result()
+                except Exception as exc:
+                    logger.warning("抓取异常，跳过 %s：%s", url, exc)
+                    fetched[url] = None
+
+    pages: list[dict[str, Any]] = []
+    seen_final: set[str] = set()
+
+    for candidate in candidates:
+        url = candidate["url"]
+
+        if candidate["prefetched"]:
+            page = {
+                "title": candidate["title"],
+                "url": url,
+                "raw_content": candidate["raw_content"],
+            }
+        else:
+            page = fetched.get(url)
+
         if page is None:
             continue
+
         key = _normalize_url(page["url"])
         if key in seen_final:
-            # 不同短链重定向到同一页，抓完才发现撞车
             logger.info("重定向撞车，跳过 %s", page["url"])
             continue
+
         seen_final.add(key)
         pages.append(page)
+
     return pages
 
 def research_report(query: str, *, cfg: Config | None = None, with_costs: bool = False) -> dict[str, Any]:

@@ -1,0 +1,56 @@
+[
+  {
+    "id": "q01",
+    "kind": "open",
+    "query": "当模型参数中编码的知识与检索到的外部文档冲突时，大模型通常表现出哪些行为模式？有哪些缓解策略？"
+  },
+  {
+    "id": "q02",
+    "kind": "open",
+    "query": "上下文知识冲突（context-memory conflict）与参数知识冲突的成因、检测方法和评测基准综述"
+  },
+  {
+    "id": "q03",
+    "kind": "open",
+    "query": "参数微调（如 SFT、LoRA）在注入新知识时为何容易引发灾难性遗忘和知识冲突？主要缓解方法与取舍"
+  },
+  {
+    "id": "q04",
+    "kind": "open",
+    "query": "持续微调与知识编辑（knowledge editing）在解决知识冲突上的分工与适用边界"
+  },
+  {
+    "id": "q05",
+    "kind": "fact",
+    "query": "Which fine-tuning method freezes the pretrained weights and injects trainable low-rank matrices into attention layers?",
+    "answer": "LoRA (Low-Rank Adaptation)"
+  },
+  {
+    "id": "q06",
+    "kind": "fact",
+    "query": "What is the term for the phenomenon where fine-tuning on new data causes a model to forget previously learned knowledge?",
+    "answer": "Catastrophic forgetting"
+  },
+  {
+    "id": "q07",
+    "kind": "fact",
+    "query": "What is the name of the benchmark that evaluates whether LLMs rely on parametric knowledge or retrieved context when the two conflict?",
+    "answer": "Knowledge Conflict benchmark (e.g., ConflictBank / FaithEval)"
+  },
+  {
+    "id": "q08",
+    "kind": "fact",
+    "query": "In which year was the LoRA paper 'LoRA: Low-Rank Adaptation of Large Language Models' released on arXiv?",
+    "answer": "2021"
+  },
+  {
+    "id": "q09",
+    "kind": "open",
+    "query": "参数微调注入的新知识与模型原有参数知识冲突时，如何评估冲突程度并设计消解方案？请给出证据和取舍"
+  },
+  {
+    "id": "q10",
+    "kind": "open",
+    "query": "面向知识冲突检测与缓解的微调方法（如冲突感知训练、知识编辑、RAG 与微调结合）的常见实现方式和评估指标"
+  }
+]

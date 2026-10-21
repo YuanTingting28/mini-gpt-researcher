@@ -74,6 +74,32 @@ def _env_list(key: str, default: tuple[str, ...]) -> tuple[str, ...]:
     out = [part for part in items if part]
     return tuple(dict.fromkeys(out)) or default
 
+def _env_paths(key: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    """读路径列表；不能复用 _env_list，因为它会把路径 lower()。"""
+    raw = os.environ.get(key, "").strip()
+    if not raw:
+        return default
+
+    parts = [
+        p.strip().strip('"').strip("'")
+        for p in raw.replace(";", ",").split(",")
+    ]
+
+    out: list[str] = []
+    seen: set[str] = set()
+
+    for part in parts:
+        if not part:
+            continue
+
+        expanded = os.path.expandvars(os.path.expanduser(part))
+        key_norm = os.path.normcase(os.path.abspath(expanded))
+
+        if key_norm not in seen:
+            seen.add(key_norm)
+            out.append(expanded)
+
+    return tuple(out) or default
 
 def _default_retrievers() -> tuple[str, ...]:
     """阶段17：RETRIEVERS 没配就退回单源 RETRIEVER —— 老 .env 一个字都不用改。"""
@@ -144,6 +170,9 @@ class Config:
     chunk_size: int = _env_int("CHUNK_SIZE", 1000)
     chunk_overlap: int = _env_int("CHUNK_OVERLAP", 150)
     report_type: str = _env_str("REPORT_TYPE", "research_report")
+    #: 报告输出语言，和检索语言解耦。auto 表示跟随研究任务语言；
+    #: 英文资料 + 中文报告可以设成 zh。
+    report_language: str = _env_str("REPORT_LANGUAGE", "auto")
     total_words: int = _env_int("TOTAL_WORDS", 1000)
     llm_timeout: int = _env_int("LLM_TIMEOUT", 120)
     #这里有爬取正文的事-所以和爬虫有关
@@ -161,6 +190,15 @@ class Config:
     paper_wiki_concurrency: int = _env_int("PAPER_WIKI_CONCURRENCY", 2)
     # 检索器的 HTTP 超时
     request_timeout: int = _env_int("REQUEST_TIMEOUT", 15)
+    # ---- 本地文档研究（阶段19）----
+    document_paths: tuple[str, ...] = _env_paths("DOCUMENT_PATHS", ())
+    document_index: str = _env_str("DOCUMENT_INDEX", "document_index/index.json")
+    document_max_results: int = _env_int("DOCUMENT_MAX_RESULTS", 8)
+    document_relative_threshold: float = _env_float(
+        "DOCUMENT_RELATIVE_THRESHOLD", 0.5
+    )
+    document_max_file_mb: int = _env_int("DOCUMENT_MAX_FILE_MB", 100)
+    report_language: str = _env_str("REPORT_LANGUAGE", "zh")
     def show(self) -> str:
         """给 ``main.py check`` 用：把当前配置列出来，key 一律打码。"""
         lines = []

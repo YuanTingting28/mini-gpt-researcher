@@ -1,8 +1,9 @@
-"""arXiv 论文 -> 中文结构化卡片。
+"""英文资料 -> 中文结构化卡片。
 
 位置：curator 之后、select_context 之前。
 卡片不是最终报告，只是把英文论文整理成中文可检索、可引用的证据。
 英文原文必须保留，事实核查以原文为准。
+本地 PDF 是 file://，也必须能走这条桥，而不是只处理 arXiv。
 """
 from __future__ import annotations
 
@@ -24,8 +25,34 @@ _JSON_FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.M)
 def is_arxiv(url:str) -> bool:
     return "arxiv.org" in (url or "").lower()
 
+
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+
+
+def should_enrich(page: dict[str, Any], cfg: Config) -> bool:
+    """报告要中文时，把英文页面也送进中文卡片桥。"""
+    if page.get("paper_card"):
+        return False
+    if is_arxiv(page.get("url", "")):
+        return True
+    language = str(getattr(cfg, "report_language", "auto") or "auto").strip().lower()
+    if language not in {"zh", "cn", "chinese", "中文"}:
+        return False
+    text = page.get("raw_content") or ""
+    return bool(text.strip()) and not _CJK_RE.search(text)
+
 def _clean_json(text:str)->str:
     return _JSON_FENCE.sub("",(text or "").strip()).strip()
+
+def should_enrich(page, cfg):
+    if page.get("paper_card"):
+        return False
+    if is_arxiv(page.get("url", "")):
+        return True
+    if cfg.report_language != "zh":
+        return False
+    text = page.get("raw_content") or ""
+    return bool(text.strip()) and not _CJK_RE.search(text)
 
 #这里是提取论文的信息界面
 def analyze_paper(page:dict[str,Any],*,cfg:Config) -> dict[str,Any] | None:
@@ -58,6 +85,17 @@ def analyze_paper(page:dict[str,Any],*,cfg:Config) -> dict[str,Any] | None:
     2. key_quotes 至少 2 条，必须是原文英文原句，不得改写。
     3. 中文术语首次出现写成「中文（English）」。
     4. 只输出 JSON，不要解释。
+    5.输入资料可能是英文，但最终报告必须用中文写作。
+
+    保留英文的内容：
+    - 模型名、方法名、数据集名、指标名、论文标题、公式变量、专有名词
+    - 引用原文和参考文献标题
+    
+    使用中文的内容：
+    - 标题、章节名、解释性正文、分析、判断、结论、表格表头
+    
+    首次出现可以写“中文解释（English Name）”，后文直接使用英文名或缩写。
+    不要因为资料是英文就把整段解释改写成英文。
     """
     try:
         raw = chat(
@@ -131,15 +169,12 @@ def enrich_papers(
     *,
     cfg: Config | None = None,
 ) -> list[dict[str, Any]]:
-    """只增强 arXiv 页面；失败原样返回，绝不丢页。"""
+    """只增强英文页面；失败原样返回，绝不丢页。"""
     cfg = cfg or load_config()
     if not cfg.paper_wiki:
         return pages
 
-    targets = [
-        page for page in pages
-        if is_arxiv(page.get("url", "")) and not page.get("paper_card")
-    ][: cfg.paper_wiki_max]
+    targets = [page for page in pages if should_enrich(page, cfg)][: cfg.paper_wiki_max]
 
     if not targets:
         return pages

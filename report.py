@@ -28,7 +28,7 @@ from agent_creator import writing_persona
 from config import Config, load_config
 from llm import chat
 from prompts import (report_conclusion_prompt, report_introduction_prompt,
-                     report_prompt)
+                     report_prompt, resolve_report_language)
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +45,10 @@ _TOC_HEADING = re.compile(r"^#{1,3}\s*(目录|Table of Contents)\s*[:：]?\s*$",
 
 BODY_TEMPERATURE = 0.35      # 对照上游 report_generation.py:298
 SIDE_TEMPERATURE = 0.25      # 引言/结论，对照上游 :48 和 :100
+
+
+def _report_language(query: str, cfg: Config | None = None) -> str:
+    return resolve_report_language(query, getattr(cfg, "report_language", None))
 # ------------------------------------------------------------------ 编号解析
 def parse_context_sources(context: str) -> list[dict[str, Any]]:
     """
@@ -189,10 +193,17 @@ def build_report_prompt(query: str, context: str, *, cfg: Config,extra:str="",pe
         max_source=max((s["n"] for s in sources),default=0),
         extra=extra,
         persona=persona,
+        report_language=getattr(cfg, "report_language", None),
     )
 
 
-def add_references(report: str, sources: list[dict[str, Any]]) -> str:
+def add_references(
+    report: str,
+    sources: list[dict[str, Any]],
+    *,
+    query: str = "",
+    cfg: Config | None = None,
+) -> str:
     """给报告末尾补参考文献表，并校验角标编号。
 
     对照源码：gpt_researcher/agent.py:700
@@ -214,6 +225,9 @@ def add_references(report: str, sources: list[dict[str, Any]]) -> str:
        参数 sources 是 parse_context_sources() 的返回值（带 n 的编号来源表），
        不是 build_context() 的 pages。
        """
+    language = resolve_report_language(query, getattr(cfg, "report_language", None))
+    heading = "## References" if language == "en" else "## 参考文献"
+    untitled = "(untitled)" if language == "en" else "(无标题)"
     by_n = {s["n"]: s for s in sources}
     body, dropped = validate_citations(report, set(by_n))
     if dropped:
@@ -231,17 +245,42 @@ def add_references(report: str, sources: list[dict[str, Any]]) -> str:
     groups: dict[tuple[str, str], list[int]] = {}
     for n in cited:
         s = by_n[n]
-        groups.setdefault((s.get("url") or "", s.get("title") or ""), []).append(n)
-    lines = ["", "", "## 参考文献", ""]
+        title = str(s.get("title") or "").strip() or untitled
+        if language == "en":
+            title = re.sub(r"\s*·\s*第\s*(\d+)\s*页\s*$", r" · page \1", title)
+        groups.setdefault((s.get("url") or "", title), []).append(n)
+    lines = ["", "", heading, ""]
     for (url, title), nums in groups.items():
         label = "".join(f"[{n}]" for n in nums)
         tail = f" — {url}" if url else ""
-        lines.append(f"- {label} {title or '(无标题)'}{tail}")
+        lines.append(f"- {label} {title}{tail}")
     return body.rstrip() + "\n" + "\n".join(lines) + "\n"
 
-def _generate(prompt:str,cfg: Config,*,step:str,temperature:float) -> str:
+def _generate(
+    prompt: str,
+    cfg: Config,
+    *,
+    step: str,
+    temperature: float,
+    query: str | None = None,
+) -> str:
+    messages = [{"role": "user", "content": prompt}]
+    if query is not None:
+        if _report_language(query, cfg) == "en":
+            system = (
+                "You are a research report writer. Write the entire response in English. "
+                "Preserve Chinese proper nouns, model names, method names, dataset names, "
+                "metrics, paper titles, formulas and citation titles in their original form."
+            )
+        else:
+            system = (
+                "你是一名中文研究报告撰写者。输入资料可能是英文，但最终输出必须是中文。"
+                "模型名、方法名、数据集名、指标名、论文标题、公式变量和专有名词保留英文原文；"
+                "除术语、表格原文和引用外，不要输出整段英文。"
+            )
+        messages.insert(0, {"role": "system", "content": system})
     text = chat(
-        [{"role":"user","content":prompt}],
+        messages,
         cfg=cfg,
         temperature=temperature,
         max_tokens=cfg.smart_token_limit,
@@ -259,12 +298,12 @@ def _generate(prompt:str,cfg: Config,*,step:str,temperature:float) -> str:
         )
     return text.strip()
 
-def _generate_optional(prompt:str,cfg: Config,*,step:str) -> str:
+def _generate_optional(prompt:str,cfg: Config,*,step:str,query:str|None=None) -> str:
     """引言/结论属于锦上添花，失败只跳过，不影响正文
     局部失败降级，全局失败停下，但一定要打日志
     """
     try:
-        return _generate(prompt,cfg=cfg,step=step,temperature=SIDE_TEMPERATURE)
+        return _generate(prompt,cfg=cfg,step=step,temperature=SIDE_TEMPERATURE,query=query)
     except Exception as exc:
         logger.warning("「%s」生成失败，已跳过（正文仍然可用）：%s", step, exc)
         return ""
@@ -295,13 +334,14 @@ def write_report(
     sources = parse_context_sources(context) if sources is None else sources
     n_sources = max((s["n"] for s in sources),default=0)
     body = _generate(build_report_prompt(query,context, cfg=cfg,extra=extra_instructions),
-                     cfg,step="正文",temperature=BODY_TEMPERATURE)
+                     cfg,step="正文",temperature=BODY_TEMPERATURE,query=query)
     body = _clean_report(body,drop_conclusion=with_conclusion)
     if with_introduction:
         intro = _generate_optional(
-            report_introduction_prompt(query, context, max_source=n_sources),
+            report_introduction_prompt(query, context, max_source=n_sources, report_language=getattr(cfg, "report_language", None)),
             cfg,
             step="引言",
+            query=query,
         )
         if intro:
             body = _insert_introduction(
@@ -310,15 +350,19 @@ def write_report(
 
     if with_conclusion:
         conclusion = _generate_optional(
-            report_conclusion_prompt(query, body), cfg, step="结论"
+            report_conclusion_prompt(query, body, report_language=getattr(cfg, "report_language", None)),
+            cfg,
+            step="结论",
+            query=query,
         )
         if conclusion:
             conclusion = _drop_h1(_clean_report(conclusion, drop_conclusion=True))
             conclusion = _CONC_HEADING.sub("", conclusion).strip()
             if conclusion:
-                body = body.rstrip() + "\n\n## 结论\n\n" + conclusion
+                heading = "## Conclusion" if _report_language(query, cfg) == "en" else "## 结论"
+                body = body.rstrip() + f"\n\n{heading}\n\n" + conclusion
 
-    return add_references(body, sources)
+    return add_references(body, sources, query=query, cfg=cfg)
 def write_body(
         query:str,
         context:str,
@@ -344,7 +388,8 @@ def write_body(
                                          persona=writing_persona(expert))
                      ,cfg
                      ,step="正文"
-                     ,temperature=BODY_TEMPERATURE)
+                     ,temperature=BODY_TEMPERATURE
+                     ,query=query)
     return _clean_report(body,drop_conclusion=drop_conclusion)
 
 def add_side_sections(
@@ -363,9 +408,10 @@ def add_side_sections(
     n_sources = max((s["n"] for s in sources),default=0)
     if with_introduction:
         intro = _generate_optional(
-            report_introduction_prompt(query, context, max_source=n_sources),
+            report_introduction_prompt(query, context, max_source=n_sources, report_language=getattr(cfg, "report_language", None)),
             cfg,
             step="引言",
+            query=query,
         )
         if intro:
             body = _insert_introduction(
@@ -374,15 +420,19 @@ def add_side_sections(
 
     if with_conclusion:
         conclusion = _generate_optional(
-            report_conclusion_prompt(query, body), cfg, step="结论"
+            report_conclusion_prompt(query, body, report_language=getattr(cfg, "report_language", None)),
+            cfg,
+            step="结论",
+            query=query,
         )
         if conclusion:
             conclusion = _drop_h1(_clean_report(conclusion, drop_conclusion=True))
             conclusion = _CONC_HEADING.sub("", conclusion).strip()
             if conclusion:
-                body = body.rstrip() + "\n\n## 结论\n\n" + conclusion
+                heading = "## Conclusion" if _report_language(query, cfg) == "en" else "## 结论"
+                body = body.rstrip() + f"\n\n{heading}\n\n" + conclusion
 
-    return add_references(body, sources)
+    return add_references(body, sources, query=query, cfg=cfg)
 
 def save_report(query: str, report: str, *, out_dir: str | Path = "outputs") -> Path:
     """落盘到 outputs/<时间戳>-<slug>.md。"""

@@ -360,7 +360,7 @@ def select_context(query: str, pages: list[dict[str, Any]], *, cfg: Config | Non
     mode = (cfg.context_filter or "auto").strip().lower()
     if mode == "auto":
         mode = "keyword"
-    if mode not in ("keyword", "auto"):
+    if mode not in ("keyword", "none", "auto"):
         logger.warning("CONTEXT_FILTER=%r 本阶段未实现，回落 keyword", cfg.context_filter)
         mode = "keyword"
     usable = [p for p in pages if (p.get("raw_content") or "").strip()]

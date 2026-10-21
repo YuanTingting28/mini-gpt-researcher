@@ -12,7 +12,73 @@
 """
 from __future__ import annotations
 
+import json
+import re
 from datetime import datetime, timezone
+
+
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+_ASCII_WORD_RE = re.compile(r"[A-Za-z]{2,}")
+
+
+def query_language(text: str) -> str | None:
+    """粗判查询语言，只用于决定子问题该用哪种文字。
+
+    返回 "zh" / "en" / None。这是启发式，不追求语言学准确：
+    - 只有汉字 -> zh
+    - 只有英文单词 -> en
+    - 中英混排时按占优势的一方判断；势均力敌则返回 None，不强行改。
+    """
+    raw = text or ""
+    cjk = len(_CJK_RE.findall(raw))
+    ascii_words = len(_ASCII_WORD_RE.findall(raw))
+
+    if cjk and not ascii_words:
+        return "zh"
+    if ascii_words and not cjk:
+        return "en"
+    if cjk > ascii_words * 2:
+        return "zh"
+    if ascii_words > cjk * 2:
+        return "en"
+    return None
+
+
+def language_name(code: str | None) -> str:
+    return {"zh": "中文", "en": "英文"}.get(code, "与研究任务相同的语言")
+
+
+def resolve_report_language(query: str, report_language: str | None = None) -> str:
+    """报告语言和检索语言分开：查询是英文，也可以写中文报告。"""
+    raw = (report_language or "").strip().lower()
+    if raw in {"zh", "cn", "chinese", "中文"}:
+        return "zh"
+    if raw in {"en", "english", "英文"}:
+        return "en"
+    return query_language(query) or "zh"
+
+
+def report_language_instruction(query: str, report_language: str | None = None) -> str:
+    """写进 Writer 提示词的输出语言契约。"""
+    code = resolve_report_language(query, report_language)
+    if code == "en":
+        return """OUTPUT LANGUAGE (HARD REQUIREMENT):
+- Write the entire report in English: title, section headings, body, introduction and conclusion.
+- Sources may contain Chinese. Preserve Chinese proper nouns, model names, method names,
+  dataset names, metrics, paper titles, formulas and variable names in their original form.
+- On first mention, use "Chinese term (English Name)" when helpful; afterwards use the English name or abbreviation.
+- Table headers should be English; proper nouns inside cells may remain in their original language.
+- Keep reference titles and quoted source text in their original language.
+- Do not copy whole Chinese paragraphs; explanatory prose must be English."""
+    return """输出语言（硬性要求）：
+- 整篇报告用中文写作：标题、章节名、正文、引言、结论都用中文。
+- 输入资料可能是英文，但不要因此把正文改写成英文；先理解英文资料，再用中文解释。
+- 保留英文：模型名、方法名、数据集名、指标名、论文标题、公式变量、专有名词和引用原文。
+- 首次出现时可以写成“中文解释（English Name）”，后文直接使用英文名或缩写。
+- 表格表头用中文；单元格中的模型名、方法名、指标、数据集可以保留英文。
+- 参考文献标题保留英文原文，不要翻译。
+- 除上述术语、表格内容和引用外，解释性文字必须使用中文。
+- 严禁因为资料来源是英文就输出整段英文正文。"""
 
 
 def quick_summary_prompt(query:str,context:str)->str:
@@ -45,7 +111,17 @@ def search_queries_prompt(query:str,max_queries:int=4,persona:str="")->str:
     3.明确禁止搜索操作符
     """
     today = datetime.now(timezone.utc).strftime("%Y 年 %m 月 %d 日")
-    example = "，".join(f'"子查询{i + 1}"' for i in range(max_queries))
+    target = query_language(query)
+    target_name = language_name(target)
+
+    # 示例本身也会影响输出语言：英文任务不能给中文示例，否则模型很容易
+    # 把 "子查询1" 当成模板，整批输出中文。
+    if target == "en":
+        example = ", ".join(f'"search query {i + 1}"' for i in range(max_queries))
+    elif target == "zh":
+        example = ", ".join(f'"子查询{i + 1}"' for i in range(max_queries))
+    else:
+        example = ", ".join(f'"query {i + 1}"' for i in range(max_queries))
     persona_block = f"{persona}\n\n" if persona else ""
 
     return f"""请围绕下面的研究任务，生成{max_queries}条搜索查询:
@@ -60,6 +136,31 @@ def search_queries_prompt(query:str,max_queries:int=4,persona:str="")->str:
 5. 如果研究任务过于模糊或信息不足，无法拆解成有意义的子问题（例如只有一个
    字母、一个含义不明的词、或明显的输入错误），直接返回空数组 []，
    不要为了凑数而生成泛泛而谈的查询。
+6. 每条子问题必须使用{target_name}输出。研究任务是英文就全部用英文，研究任务是中文
+   就全部用中文；不要把研究任务翻译成另一种语言。子问题的语言必须和原问题一致，
+   因为检索器会直接拿它去匹配原始资料。
+"""
+
+
+def rewrite_queries_language_prompt(
+    query: str,
+    queries: list[str],
+    target_language: str,
+) -> str:
+    """把已经生成的子问题改写成目标语言，保持原意和数量。"""
+    payload = json.dumps(queries, ensure_ascii=False)
+    return f"""下面有一组搜索子问题，但它们和原研究任务的语言不一致。
+
+原研究任务：
+{query}
+
+原子问题：
+{payload}
+
+请把每个子问题改写成{target_language}，要求：
+1. 保持原意、检索角度和数量，不要合并、不要新增、不要解释。
+2. 不要使用 site:、filetype:、OR、AND、NOT 等搜索操作符。
+3. 只输出一个 JSON 字符串数组，格式为 ["...", "..."]，不要输出其他内容。
 """
 
 def expert_profile_prompt(question:str)->str:
@@ -90,7 +191,7 @@ def expert_profile_prompt(question:str)->str:
     3. focus 必须是能直接拿去搜索的名词短语，不要写成疑问句。
     """
 
-def report_prompt(query: str, context: str, *, total_words: int = 1000, max_source: int = 0,extra:str="",persona:str="") -> str:
+def report_prompt(query: str, context: str, *, total_words: int = 1000, max_source: int = 0,extra:str="",persona:str="",report_language:str|None=None) -> str:
     """阶段 6 正文提示词。对照源码：gpt_researcher/prompts.py:262
 
     extra:阶段9用，上一轮评审提出的缺口，追加在写作要求后面 用来把上一轮评审意见喂给写作者
@@ -101,9 +202,12 @@ def report_prompt(query: str, context: str, *, total_words: int = 1000, max_sour
     if extra:
         extra_block = f"\n补充要求（必须逐条正面处理）：\n{extra}\n"
     persona_block = f"{persona}\n\n" if persona else ""
+    language_rule = report_language_instruction(query, report_language)
     return f"""请仅根据下面提供的资料，就下面的研究任务写一篇详细的报告。
 
     研究任务："{query}"
+
+    {language_rule}
 
     {persona_block}资料（每条以 [编号] 开头）：
     
@@ -124,45 +228,49 @@ def report_prompt(query: str, context: str, *, total_words: int = 1000, max_sour
     8. 对比类信息用 Markdown 表格呈现。
     9. 全文约 {total_words} 字，力求详尽，把资料里有价值的信息都用上。
     10. 要有明确的判断和取舍，不要写"各有优劣""取决于具体情况"这种不表态的话。
-    11. 用与"研究任务"相同的语言写作。
+    11. 严格遵守上面的输出语言要求。资料是英文时，先理解再用中文解释，不要整段照搬英文。
     {extra_block}
     假设当前日期是 {today}。
 """
 
-def report_introduction_prompt(query: str, context: str, *, max_source: int = 0) -> str:
+def report_introduction_prompt(query: str, context: str, *, max_source: int = 0, report_language: str | None = None) -> str:
     """引言。对照源码：gpt_researcher/prompts.py:707
 
     上游让这一调用负责写 H1 主标题；我们让正文负责 H1，引言只写段落，
     否则正文和引言各出一个 # 标题，报告会有两个主标题。
     """
     range_hint = f"（1 到 {max_source}）" if max_source else ""
+    language_rule = report_language_instruction(query, report_language)
     return f"""下面是为研究任务收集的资料：
     {context}
     
     请为"研究任务：{query}"写一段报告引言，要求：
+    {language_rule}
     1. 不要写 "# " 一级标题，报告主标题已经由正文写好了。
     2. 3 到 5 句话：说清这个任务为什么值得研究、报告会覆盖哪几个方面。
     3. 事实性内容要带 [编号] 角标，编号必须是资料里真实存在的编号{range_hint}。
     4. 不要写"参考文献"章节。
-    5. 用与"研究任务"相同的语言写作。
+    5. 严格遵守上面的输出语言要求。
     """
 
 
-def report_conclusion_prompt(query: str, report: str) -> str:
+def report_conclusion_prompt(query: str, report: str, *, report_language: str | None = None) -> str:
     """结论。对照源码：gpt_researcher/prompts.py:720
 
     上游把这条规则写进提示词："如果没有 ## Conclusion 就自己加一个"。
     我们反过来：让模型别加标题，由程序加 —— 标题格式统一由代码控制。
     """
+    language_rule = report_language_instruction(query, report_language)
     return f"""下面是一篇已经写好的研究报告：
 {report}
 
 请就"研究任务：{query}"写一段结论，要求：
+{language_rule}
 1. 不要写 "# " 一级标题，也不要写 "## 结论" 这个标题本身（程序会加）。
 2. 分 2 到 3 段：先概括主要发现，再给出最重要的判断，最后说局限或下一步。
 3. 只能依据报告里已有的内容，不要引入新事实；可以直接复用报告里的 [编号] 角标。
 4. 不要写"参考文献"章节。
-5. 用与"研究任务"相同的语言写作。
+5. 严格遵守上面的输出语言要求。
 """
 
 def reviewer_prompt(query: str, report: str, context: str, *,
@@ -216,6 +324,8 @@ def reviewer_prompt(query: str, report: str, context: str, *,
 {item_unsupported}
 2. missing：哪些缺口是"再检索一轮就有机会补上"的？每条一句话，必须具体到能当检索词用，
    最多 3 条。不要写"可以更详细"这种没法执行的意见。
+   每条 missing 必须和研究任务使用同一种语言；研究任务是英文就用英文写检索缺口，
+   是中文就用中文。否则下一轮会拿错误语言的词去检索原始资料。
 3. unfixable：哪些是资料里根本没有、再检索也大概率补不上的？
    （典型：某类对照实验根本没被公开做过、某个指标没有实测数据、某个机制没有公开讨论。）
    这类**不要**放进 missing。对每一条，说明"报告应该怎样如实声明这个边界"。
